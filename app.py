@@ -258,32 +258,31 @@ def renew_service(page):
             page.screenshot(path="renew_modal_failed.png")
             return False
 
-        # --- 强效处理弹窗内部的 Cloudflare 验证 ---
+        # 处理弹窗内部的 Cloudflare 验证
         log("⏳ 正在检查并处理弹窗内部的 Cloudflare 验证码...")
         time.sleep(3)
         handle_cloudflare(page)
-        time.sleep(2)  # 给验证 Token 写入 DOM 留出时间
+        time.sleep(2)
 
-        # --- 提交 Create Invoice 步骤 ---
+        # 提交 Create Invoice 步骤
         log("🖱️ 点击 'Create Invoice' 并等待发票生成...")
         new_invoice_url = None
         
         for attempt in range(1, 4):
             log(f"🖱️ 第 {attempt} 次提交 'Create Invoice'...")
             
-            # 使用 Playwright 强制点击，并结合 JS 强行提交弹窗内的表单
             try:
                 create_btn.click(force=True)
             except Exception as e:
-                log(f"⚠️ 物理点击受阻，尝试 JS 点击: {e}")
+                log(f"⚠️ 物理点击受阻: {e}")
             
-            # 辅助 JS 提交逻辑，防止按钮防刷逻辑拦截 click
+            # 使用原生标准的 JS 语法进行查找到并触发点击
             page.evaluate("""() => {
-                const btn = document.querySelector('button:has-text("Create Invoice")') || 
-                            Array.from(document.querySelectorAll('button')).find(el => el.textContent.includes('Create Invoice'));
-                if (btn) {
-                    btn.click();
-                    if (btn.form) btn.form.submit();
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const targetBtn = buttons.find(btn => btn.textContent.includes('Create Invoice'));
+                if (targetBtn) {
+                    targetBtn.click();
+                    if (targetBtn.form) targetBtn.form.submit();
                 }
             }""")
 
@@ -293,10 +292,9 @@ def renew_service(page):
                 current_url = page.url
                 if "/payment/invoice/" in current_url or "/invoices/" in current_url or "/invoice/" in current_url:
                     new_invoice_url = current_url
-                    log(f"🎉 成功成功进入发票页面: {new_invoice_url}")
+                    log(f"🎉 成功进入发票页面: {new_invoice_url}")
                     break
                 
-                # 如果中途出现 Cloudflare 拦截，重新过验
                 if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
                     handle_cloudflare(page)
                 
