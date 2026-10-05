@@ -85,10 +85,11 @@ def send_telegram_notification(status, old_due, new_due):
         return False
 
 def handle_cloudflare(page):
+    """处理页面或弹窗中的 Cloudflare 验证框"""
     iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
     if page.locator(iframe_selector).count() == 0:
         return True
-    log("⚠️ 检测到 Cloudflare 验证...")
+    log("⚠️ 检测到 Cloudflare 验证，开始自动过验...")
     start_time = time.time()
     while time.time() - start_time < 60:
         if page.locator(iframe_selector).count() == 0:
@@ -98,7 +99,7 @@ def handle_cloudflare(page):
             frame = page.frame_locator(iframe_selector)
             checkbox = frame.locator('input[type="checkbox"]')
             if checkbox.is_visible():
-                log("🖱️ 点击验证复选框...")
+                log("🖱️ 点击 Cloudflare 验证复选框...")
                 time.sleep(random.uniform(0.5, 1.5))
                 checkbox.click()
                 log("⏳ 已点击，等待验证结果...")
@@ -107,7 +108,7 @@ def handle_cloudflare(page):
                 time.sleep(1)
         except Exception:
             pass
-    log("❌ 验证超时。")
+    log("❌ Cloudflare 验证超时。")
     return False
 
 def login(page):
@@ -230,18 +231,17 @@ def renew_service(page):
             try:
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
-                log(f"🖱️️ 第 {i+1} 次尝试点击 'Renew'...")
+                log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
 
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 time.sleep(2)
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
                     page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
+                    return "NOT_TIME"
 
-                log("🖲️️ 等待弹窗出现...")
+                log("🖲️ 等待弹窗出现...")
                 try:
                     create_btn.wait_for(state="visible", timeout=5000)
                     modal_opened = True
@@ -258,29 +258,50 @@ def renew_service(page):
             page.screenshot(path="renew_modal_failed.png")
             return False
 
-        # 处理弹窗内可能出现的 Cloudflare 验证
-        time.sleep(2)
+        # --- 强效处理弹窗内部的 Cloudflare 验证 ---
+        log("⏳ 正在检查并处理弹窗内部的 Cloudflare 验证码...")
+        time.sleep(3)
         handle_cloudflare(page)
+        time.sleep(2)  # 给验证 Token 写入 DOM 留出时间
 
-        # 循环点击 Create Invoice 并等待跳转
-        log("🖱️ 点击 'Create Invoice'...")
+        # --- 提交 Create Invoice 步骤 ---
+        log("🖱️ 点击 'Create Invoice' 并等待发票生成...")
         new_invoice_url = None
         
-        for attempt in range(3):
-            if create_btn.is_visible():
-                create_btn.click()
-                log(f"🖱️ 第 {attempt + 1} 次点击 Create Invoice，等待跳转...")
+        for attempt in range(1, 4):
+            log(f"🖱️ 第 {attempt} 次提交 'Create Invoice'...")
             
+            # 使用 Playwright 强制点击，并结合 JS 强行提交弹窗内的表单
+            try:
+                create_btn.click(force=True)
+            except Exception as e:
+                log(f"⚠️ 物理点击受阻，尝试 JS 点击: {e}")
+            
+            # 辅助 JS 提交逻辑，防止按钮防刷逻辑拦截 click
+            page.evaluate("""() => {
+                const btn = document.querySelector('button:has-text("Create Invoice")') || 
+                            Array.from(document.querySelectorAll('button')).find(el => el.textContent.includes('Create Invoice'));
+                if (btn) {
+                    btn.click();
+                    if (btn.form) btn.form.submit();
+                }
+            }""")
+
+            # 轮询等待 URL 跳转
             start_wait = time.time()
-            while time.time() - start_wait < 15:
-                if "/payment/invoice/" in page.url or "/invoices/" in page.url:
-                    new_invoice_url = page.url
-                    log(f"🎉 页面已跳转: {new_invoice_url}")
+            while time.time() - start_wait < 20:
+                current_url = page.url
+                if "/payment/invoice/" in current_url or "/invoices/" in current_url or "/invoice/" in current_url:
+                    new_invoice_url = current_url
+                    log(f"🎉 成功成功进入发票页面: {new_invoice_url}")
                     break
+                
+                # 如果中途出现 Cloudflare 拦截，重新过验
                 if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
                     handle_cloudflare(page)
+                
                 time.sleep(1)
-            
+
             if new_invoice_url:
                 break
 
@@ -299,9 +320,7 @@ def renew_service(page):
         pay_btn.click()
         log("✅ 'Pay' 按钮已点击。")
 
-        # 等待支付确认页面或跳转回服务页
         time.sleep(5)
-        # 返回服务管理页面以获取新的到期时间
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
         return True
