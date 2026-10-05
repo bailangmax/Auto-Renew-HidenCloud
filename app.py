@@ -241,9 +241,9 @@ def renew_service(page):
                     page.screenshot(path="renew_not_allowed.png")
                     return "NOT_TIME"
 
-                log("🖲️ 等待弹窗出现...")
+                log("🖲️️ 等待弹窗出现...")
                 try:
-                    create_btn.wait_for(state="visible", timeout=5000)
+                    create_btn.wait_for(state="attached", timeout=5000)
                     modal_opened = True
                     log("✅ 弹窗已成功弹出！")
                     break
@@ -258,10 +258,26 @@ def renew_service(page):
             page.screenshot(path="renew_modal_failed.png")
             return False
 
-        # 处理弹窗内部的 Cloudflare 验证
-        log("⏳ 正在检查并处理弹窗内部的 Cloudflare 验证码...")
-        time.sleep(3)
+        # 解决核心关键：等待 CF 验证通过，并等待 Create Invoice 按钮解除隐藏
+        log("⏳ 正在处理弹窗内部 Cloudflare 验证，并等待 'Create Invoice' 按钮变为可见...")
         handle_cloudflare(page)
+
+        # 明确等待按钮进入 visible 状态
+        try:
+            create_btn.wait_for(state="visible", timeout=30000)
+            log("✅ 'Create Invoice' 按钮已成功变为可见！")
+        except Exception as e:
+            log(f"⚠️ 按钮未能在 30s 内变为可见，尝试强制取消隐藏组件: {e}")
+            page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const btn = buttons.find(b => b.textContent.includes('Create Invoice'));
+                if (btn) {
+                    btn.style.display = 'block';
+                    btn.style.visibility = 'visible';
+                    btn.removeAttribute('disabled');
+                }
+            }""")
+
         time.sleep(2)
 
         # 提交 Create Invoice 步骤
@@ -271,20 +287,22 @@ def renew_service(page):
         for attempt in range(1, 4):
             log(f"🖱️ 第 {attempt} 次提交 'Create Invoice'...")
             
-            try:
-                create_btn.click(force=True)
-            except Exception as e:
-                log(f"⚠️ 物理点击受阻: {e}")
-            
-            # 使用原生标准的 JS 语法进行查找到并触发点击
+            # 使用原生 JS 触发表单提交 + 元素点击，穿透组件遮挡
             page.evaluate("""() => {
                 const buttons = Array.from(document.querySelectorAll('button'));
                 const targetBtn = buttons.find(btn => btn.textContent.includes('Create Invoice'));
                 if (targetBtn) {
+                    targetBtn.disabled = false;
                     targetBtn.click();
                     if (targetBtn.form) targetBtn.form.submit();
                 }
             }""")
+
+            try:
+                if create_btn.is_visible():
+                    create_btn.click(force=True, timeout=3000)
+            except Exception:
+                pass
 
             # 轮询等待 URL 跳转
             start_wait = time.time()
