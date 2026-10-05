@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests
+import os, re, sys, time, random, requests
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
@@ -33,7 +33,6 @@ def get_current_ip(proxy_server=None):
     proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
         resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-        # log(f"请求出口IP完成, status={resp.status_code}")
         if resp.status_code == 200:
             return resp.text.strip()
         return "获取失败"
@@ -216,7 +215,6 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page):
-
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
@@ -232,7 +230,7 @@ def renew_service(page):
             try:
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
-                log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
+                log(f"🖱️️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
 
                 # 等待一小段时间，检测是否出现“未到续期时间”弹窗
@@ -243,7 +241,7 @@ def renew_service(page):
                     page.screenshot(path="renew_not_allowed.png")
                     return "NOT_TIME"   # 特殊状态
 
-                log("🖲️ 等待弹窗出现...")
+                log("🖲️️ 等待弹窗出现...")
                 try:
                     create_btn.wait_for(state="visible", timeout=5000)
                     modal_opened = True
@@ -260,21 +258,31 @@ def renew_service(page):
             page.screenshot(path="renew_modal_failed.png")
             return False
 
+        # 处理弹窗内可能出现的 Cloudflare 验证
+        time.sleep(2)
         handle_cloudflare(page)
-        log("🖱️ 点击 'Create Invoice'...")
-        create_btn.click()
 
+        # 循环点击 Create Invoice 并等待跳转
+        log("🖱️ 点击 'Create Invoice'...")
         new_invoice_url = None
-        start_wait = time.time()
-        while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
-                new_invoice_url = page.url
-                log(f"🎉 页面已跳转: {new_invoice_url}")
+        
+        for attempt in range(3):
+            if create_btn.is_visible():
+                create_btn.click()
+                log(f"🖱️ 第 {attempt + 1} 次点击 Create Invoice，等待跳转...")
+            
+            start_wait = time.time()
+            while time.time() - start_wait < 15:
+                if "/payment/invoice/" in page.url or "/invoices/" in page.url:
+                    new_invoice_url = page.url
+                    log(f"🎉 页面已跳转: {new_invoice_url}")
+                    break
+                if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+                    handle_cloudflare(page)
+                time.sleep(1)
+            
+            if new_invoice_url:
                 break
-            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("⚠️ 遇到拦截，尝试处理...")
-                handle_cloudflare(page)
-            time.sleep(1)
 
         if not new_invoice_url:
             log("❌ 未能进入发票页面，超时。")
@@ -380,6 +388,6 @@ def main():
         finally:
             if 'browser' in locals() and browser:
                 browser.close()
-                
+
 if __name__ == "__main__":
     main()
