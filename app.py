@@ -5,7 +5,6 @@ import os
 import re
 import sys
 import time
-import random
 import requests
 
 from playwright.sync_api import sync_playwright
@@ -69,7 +68,7 @@ def log(message):
 
 
 # ============================================================
-# 简单反自动化特征
+# 浏览器初始化脚本
 # ============================================================
 
 STEALTH_JS = """
@@ -88,36 +87,39 @@ window.chrome = {
 
 
 # ============================================================
-# 获取当前出口 IP
+# 获取出口 IP
 # ============================================================
 
 def get_current_ip(proxy_server=None):
 
-    proxies = (
-        {
+    proxies = None
+
+    if proxy_server and IS_PROXY:
+
+        proxies = {
             "http": proxy_server,
             "https": proxy_server
         }
-        if (proxy_server and IS_PROXY)
-        else None
-    )
 
     try:
 
-        resp = requests.get(
+        response = requests.get(
             "https://api.ip.sb/ip",
             proxies=proxies,
             timeout=15
         )
 
-        if resp.status_code == 200:
-            return resp.text.strip()
+        if response.status_code == 200:
+
+            return response.text.strip()
 
         return "获取失败"
 
     except Exception as e:
 
-        log(f"❌ 获取出口IP失败: {e}")
+        log(
+            f"❌ 获取出口IP失败: {e}"
+        )
 
         return "获取失败"
 
@@ -134,7 +136,9 @@ def send_telegram_notification(
 
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
 
-        log("⚠️ Telegram 未配置，跳过通知")
+        log(
+            "⚠️ Telegram 未配置，跳过通知"
+        )
 
         return False
 
@@ -159,7 +163,8 @@ def send_telegram_notification(
         if len(name) > 4:
 
             masked_email = (
-                f"{name[:2]}****{name[-2:]}@{domain}"
+                f"{name[:2]}****"
+                f"{name[-2:]}@{domain}"
             )
 
         else:
@@ -201,22 +206,24 @@ def send_telegram_notification(
 
     try:
 
-        resp = requests.post(
+        response = requests.post(
             url,
             json=payload,
             timeout=10,
             proxies=REQUESTS_PROXIES
         )
 
-        if resp.status_code == 200:
+        if response.status_code == 200:
 
-            log("📨 Telegram 通知发送成功")
+            log(
+                "📨 Telegram 通知发送成功"
+            )
 
             return True
 
         log(
             f"⚠️ Telegram 返回状态码："
-            f"{resp.status_code}"
+            f"{response.status_code}"
         )
 
         return False
@@ -233,17 +240,14 @@ def send_telegram_notification(
 # ============================================================
 # Cloudflare
 #
-# 注意：
-# 不主动模拟/破解 Cloudflare。
-# 这里只负责等待页面上的 Challenge 完成。
+# 不主动破解 Cloudflare。
+# 只等待 Challenge 页面完成。
 # ============================================================
 
-def wait_for_cloudflare(
+def handle_cloudflare(
     page,
     timeout=60
 ):
-
-    log("🛡️ 检查 Cloudflare 验证...")
 
     iframe_selector = (
         'iframe[src*="challenges.cloudflare.com"]'
@@ -251,7 +255,8 @@ def wait_for_cloudflare(
 
     start_time = time.time()
 
-    found = False
+    detected = False
+
 
     while time.time() - start_time < timeout:
 
@@ -261,25 +266,24 @@ def wait_for_cloudflare(
                 iframe_selector
             ).count()
 
+
             if count > 0:
 
-                if not found:
+                if not detected:
 
                     log(
-                        "🛡️ 检测到 Cloudflare Challenge，"
+                        "🛡️ 检测到 Cloudflare 验证，"
                         "等待验证完成..."
                     )
 
-                    found = True
+                    detected = True
 
-                # 页面可能已经完成验证
-                # 这里不主动点击 CF 控件
                 time.sleep(1)
 
                 continue
 
-            # 没有 CF iframe
-            if found:
+
+            if detected:
 
                 log(
                     "✅ Cloudflare 验证完成！"
@@ -293,26 +297,17 @@ def wait_for_cloudflare(
 
             return True
 
+
         except Exception:
 
             time.sleep(1)
 
 
     log(
-        "⚠️ Cloudflare 等待超时，"
-        "继续检查页面"
+        "⚠️ Cloudflare 等待超时"
     )
 
     return False
-
-
-# 保留旧函数名称，兼容其他代码
-def handle_cloudflare(page):
-
-    return wait_for_cloudflare(
-        page,
-        timeout=60
-    )
 
 
 # ============================================================
@@ -327,7 +322,9 @@ def login(page):
 
     if COOKIE_VALUE:
 
-        log("📇 尝试 Cookie 登录...")
+        log(
+            "📇 尝试 Cookie 登录..."
+        )
 
         try:
 
@@ -347,7 +344,8 @@ def login(page):
                             "/",
 
                         "expires":
-                            int(time.time()) + 3600 * 24 * 365,
+                            int(time.time())
+                            + 3600 * 24 * 365,
 
                         "httpOnly":
                             True,
@@ -374,7 +372,9 @@ def login(page):
 
             if "auth/login" not in page.url:
 
-                log("✅ Cookie 登录成功！")
+                log(
+                    "✅ Cookie 登录成功！"
+                )
 
                 return True
 
@@ -393,14 +393,15 @@ def login(page):
     if not EMAIL or not PASSWORD:
 
         log(
-            "❌ Cookie 登录失败，"
-            "且没有配置账号密码"
+            "❌ 没有可用的登录凭证"
         )
 
         return False
 
 
-    log("💣 尝试账号密码登录...")
+    log(
+        "💣 尝试账号密码登录..."
+    )
 
 
     try:
@@ -513,20 +514,14 @@ def get_server_id(page):
             return matches[0]
 
 
-        log(
-            "❌ 页面中没有找到 Server ID"
-        )
-
-        return None
-
-
     except Exception as e:
 
         log(
             f"❌ 获取 Server ID 失败: {e}"
         )
 
-        return None
+
+    return None
 
 
 # ============================================================
@@ -559,7 +554,8 @@ def get_due_date(page):
 
         patterns = [
 
-            r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            r"Due date\s+"
+            r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
 
             r"Due date\s*\n\s*"
             r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
@@ -594,190 +590,12 @@ def get_due_date(page):
 
 
 # ============================================================
-# 查找可见 Create Invoice
+# 查找 Create Invoice
 # ============================================================
 
 def find_create_invoice(page):
 
-    # --------------------------------------------------------
-    # 方案 1：当前显示的 Modal 内寻找
-    # --------------------------------------------------------
-
-    modal_selectors = [
-
-        "div.modal.show",
-
-        "div.modal.fade.show",
-
-        '[role="dialog"]',
-
-        ".modal-dialog"
-
-    ]
-
-
-    for selector in modal_selectors:
-
-        try:
-
-            modals = page.locator(selector)
-
-            count = modals.count()
-
-            for i in range(count):
-
-                modal = modals.nth(i)
-
-                try:
-
-                    if not modal.is_visible():
-                        continue
-                except Exception:
-                    continue
-
-
-                log(
-                    f"🔎 在弹窗中寻找 Create Invoice "
-                    f"({selector})..."
-                )
-
-
-                # button
-                buttons = modal.locator(
-                    "button"
-                )
-
-                for j in range(buttons.count()):
-
-                    button = buttons.nth(j)
-
-                    try:
-
-                        if not button.is_visible():
-                            continue
-
-                        text = (
-                            button.inner_text()
-                            .strip()
-                        )
-
-                        value = (
-                            button.get_attribute(
-                                "value"
-                            )
-                            or ""
-                        )
-
-                        combined = (
-                            text + " " + value
-                        ).strip()
-
-
-                        if re.search(
-                            r"create\s*invoice",
-                            combined,
-                            re.IGNORECASE
-                        ):
-
-                            log(
-                                f"✅ 找到 Create Invoice "
-                                f"按钮：{combined}"
-                            )
-
-                            return button
-
-                    except Exception:
-                        continue
-
-
-                # input submit
-                inputs = modal.locator(
-                    'input[type="submit"], '
-                    'input[type="button"]'
-                )
-
-
-                for j in range(inputs.count()):
-
-                    element = inputs.nth(j)
-
-                    try:
-
-                        if not element.is_visible():
-                            continue
-
-
-                        value = (
-                            element.get_attribute(
-                                "value"
-                            )
-                            or ""
-                        )
-
-
-                        if re.search(
-                            r"create\s*invoice",
-                            value,
-                            re.IGNORECASE
-                        ):
-
-                            log(
-                                "✅ 找到 Create Invoice "
-                                "提交按钮"
-                            )
-
-                            return element
-
-                    except Exception:
-                        continue
-
-
-                # 文本
-                text_elements = modal.get_by_text(
-                    re.compile(
-                        r"^\s*Create\s+Invoice\s*$",
-                        re.IGNORECASE
-                    )
-                )
-
-
-                for j in range(
-                    text_elements.count()
-                ):
-
-                    element = text_elements.nth(j)
-
-                    try:
-
-                        if element.is_visible():
-
-                            log(
-                                "✅ 找到 Create Invoice 文本元素"
-                            )
-
-                            return element
-
-                    except Exception:
-                        continue
-
-
-        except Exception as e:
-
-            log(
-                f"⚠️ Modal 搜索异常：{e}"
-            )
-
-
-    # --------------------------------------------------------
-    # 方案 2：全页面寻找
-    # --------------------------------------------------------
-
-    log(
-        "🔎 在整个页面寻找 Create Invoice..."
-    )
-
-
-    candidates = [
+    selectors = [
 
         'button:has-text("Create Invoice")',
 
@@ -785,18 +603,19 @@ def find_create_invoice(page):
 
         'input[value*="Create Invoice"]',
 
-        'input[value*="create invoice" i]'
+        '[role="button"]:has-text("Create Invoice")'
 
     ]
 
 
-    for selector in candidates:
+    for selector in selectors:
 
         try:
 
             elements = page.locator(
                 selector
             )
+
 
             count = elements.count()
 
@@ -805,18 +624,12 @@ def find_create_invoice(page):
 
                 element = elements.nth(i)
 
+
                 try:
 
-                    if not element.is_visible():
-                        continue
+                    if element.is_visible():
 
-
-                    log(
-                        f"✅ 找到候选元素："
-                        f"{selector}"
-                    )
-
-                    return element
+                        return element
 
                 except Exception:
 
@@ -828,179 +641,323 @@ def find_create_invoice(page):
             continue
 
 
-    # --------------------------------------------------------
-    # 方案 3：get_by_role
-    # --------------------------------------------------------
+    return None
 
-    try:
 
-        elements = page.get_by_role(
-            "button",
-            name=re.compile(
-                r"Create\s+Invoice",
-                re.IGNORECASE
+# ============================================================
+# 查找 Pay Now
+# ============================================================
+
+def find_pay_now(page):
+
+    selectors = [
+
+        'button:has-text("Pay Now")',
+
+        'a:has-text("Pay Now")',
+
+        '[role="button"]:has-text("Pay Now")',
+
+        'input[value*="Pay Now"]'
+
+    ]
+
+
+    for selector in selectors:
+
+        try:
+
+            elements = page.locator(
+                selector
             )
-        )
 
 
-        for i in range(elements.count()):
-
-            element = elements.nth(i)
-
-            try:
-
-                if element.is_visible():
-
-                    log(
-                        "✅ get_by_role 找到 "
-                        "Create Invoice"
-                    )
-
-                    return element
-
-            except Exception:
-                continue
+            count = elements.count()
 
 
-    except Exception:
-        pass
+            for i in range(count):
+
+                element = elements.nth(i)
 
 
-    # --------------------------------------------------------
-    # 方案 4：get_by_text
-    # --------------------------------------------------------
+                try:
 
-    try:
+                    if element.is_visible():
 
-        elements = page.get_by_text(
-            re.compile(
-                r"Create\s+Invoice",
-                re.IGNORECASE
-            )
-        )
+                        return element
+
+                except Exception:
+
+                    continue
 
 
-        for i in range(elements.count()):
+        except Exception:
 
-            element = elements.nth(i)
-
-            try:
-
-                if element.is_visible():
-
-                    log(
-                        "✅ get_by_text 找到 "
-                        "Create Invoice"
-                    )
-
-                    return element
-
-            except Exception:
-                continue
-
-
-    except Exception:
-        pass
+            continue
 
 
     return None
 
 
 # ============================================================
-# 等待 Create Invoice 按钮
+# 打印当前页面按钮
 # ============================================================
 
-def wait_for_create_invoice(
+def debug_buttons(page):
+
+    log(
+        "🔍 当前页面可见按钮："
+    )
+
+
+    try:
+
+        buttons = page.locator(
+            "button:visible"
+        )
+
+
+        total = buttons.count()
+
+
+        for i in range(
+            min(total, 50)
+        ):
+
+            try:
+
+                text = (
+                    buttons.nth(i)
+                    .inner_text()
+                    .strip()
+                )
+
+
+                if text:
+
+                    log(
+                        f"   BUTTON[{i}]: {text}"
+                    )
+
+            except Exception:
+
+                continue
+
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# 保存截图
+# ============================================================
+
+def save_screenshot(
+    page,
+    filename
+):
+
+    try:
+
+        path = (
+            "/tmp/"
+            + filename
+        )
+
+
+        page.screenshot(
+            path=path,
+            full_page=True
+        )
+
+
+        log(
+            f"📸 已保存截图：{path}"
+        )
+
+
+    except Exception as e:
+
+        log(
+            f"⚠️ 保存截图失败：{e}"
+        )
+
+
+# ============================================================
+# 等待 Create Invoice
+# ============================================================
+
+def wait_create_invoice_or_pay_now(
     page,
     timeout=60
 ):
+
+    log(
+        "🔎 等待 Create Invoice / Pay Now..."
+    )
+
 
     start = time.time()
 
 
     while time.time() - start < timeout:
 
-        button = find_create_invoice(page)
+        # ====================================================
+        # 第一优先级：Create Invoice
+        # ====================================================
+
+        create_invoice = find_create_invoice(
+            page
+        )
 
 
-        if button is not None:
+        if create_invoice:
 
-            try:
+            log(
+                "✅ 找到 Create Invoice！"
+            )
 
-                if button.is_visible():
-
-                    # 检查是否 disabled
-                    disabled = button.get_attribute(
-                        "disabled"
-                    )
-
-                    aria_disabled = (
-                        button.get_attribute(
-                            "aria-disabled"
-                        )
-                    )
+            return (
+                "create_invoice",
+                create_invoice
+            )
 
 
-                    if (
-                        disabled is None
-                        and aria_disabled != "true"
-                    ):
+        # ====================================================
+        # 第二优先级：Pay Now
+        #
+        # 你的最新日志已经证明：
+        #
+        # BUTTON[11]: Pay Now
+        #
+        # 所以这里认为 Invoice 已经创建。
+        # ====================================================
 
-                        log(
-                            "✅ Create Invoice 已可点击"
-                        )
-
-                        return button
-
-
-                    log(
-                        "⏳ Create Invoice 已找到，"
-                        "但按钮暂不可用，继续等待..."
-                    )
+        pay_now = find_pay_now(
+            page
+        )
 
 
-            except Exception:
-                pass
+        if pay_now:
 
+            log(
+                "✅ 检测到 Pay Now！"
+            )
+
+            log(
+                "💡 当前页面已经存在付款按钮，"
+                "说明续期 Invoice 已经生成。"
+            )
+
+            return (
+                "pay_now",
+                pay_now
+            )
+
+
+        # ====================================================
+        # 继续等待
+        # ====================================================
 
         time.sleep(1)
 
 
-    return None
+    return (
+        None,
+        None
+    )
 
 
 # ============================================================
-# 获取页面文本
+# 点击按钮
 # ============================================================
 
-def get_body_text(page):
+def click_element(
+    element,
+    name
+):
 
     try:
 
-        return page.locator(
-            "body"
-        ).inner_text(
-            timeout=5000
+        element.scroll_into_view_if_needed(
+            timeout=10000
         )
 
     except Exception:
+        pass
 
-        return ""
+
+    time.sleep(1)
+
+
+    try:
+
+        log(
+            f"🖱️ 点击 {name}..."
+        )
+
+
+        element.click(
+            timeout=15000
+        )
+
+
+        log(
+            f"✅ {name} 点击成功"
+        )
+
+
+        return True
+
+
+    except Exception as e:
+
+        log(
+            f"⚠️ {name} 普通点击失败：{e}"
+        )
+
+
+        try:
+
+            element.click(
+                force=True,
+                timeout=10000
+            )
+
+
+            log(
+                f"✅ {name} 强制点击成功"
+            )
+
+
+            return True
+
+
+        except Exception as e2:
+
+            log(
+                f"❌ {name} 点击失败：{e2}"
+            )
+
+
+            return False
 
 
 # ============================================================
-# 续期
+# 续期主流程
 # ============================================================
 
 def renew_service(page):
 
     try:
 
-        log("➡ 进入续期流程...")
+        log(
+            "➡ 进入续期流程..."
+        )
 
 
         # ----------------------------------------------------
-        # 进入服务器页面
+        # 打开服务页面
         # ----------------------------------------------------
 
         if SERVICE_URL not in page.url:
@@ -1015,14 +972,16 @@ def renew_service(page):
         handle_cloudflare(page)
 
 
-        time.sleep(2)
+        time.sleep(3)
 
 
         # ----------------------------------------------------
-        # 点击 Renew
+        # 找 Renew
         # ----------------------------------------------------
 
-        log("🔎 寻找 Renew 按钮...")
+        log(
+            "🔎 寻找 Renew 按钮..."
+        )
 
 
         renew_button = None
@@ -1084,45 +1043,56 @@ def renew_service(page):
                 "❌ 找不到 Renew 按钮"
             )
 
+            debug_buttons(page)
+
+            save_screenshot(
+                page,
+                "hidencloud_no_renew.png"
+            )
+
             return False
 
 
-        log("🖱️ 点击 Renew...")
+        # ----------------------------------------------------
+        # 点击 Renew
+        # ----------------------------------------------------
 
+        if not click_element(
+            renew_button,
+            "Renew"
+        ):
 
-        renew_button.click(
-            timeout=15000
-        )
+            return False
 
 
         log(
-            "✅ Renew 点击完成，"
-            "等待续期弹窗..."
+            "⏳ Renew 点击完成，等待弹窗..."
         )
 
 
-        time.sleep(2)
+        time.sleep(3)
 
 
         # ----------------------------------------------------
-        # 等待 Cloudflare
+        # Cloudflare
         # ----------------------------------------------------
 
         handle_cloudflare(
-            page
+            page,
+            timeout=60
         )
 
 
-        # Cloudflare 完成以后再给网站 JS 时间
         log(
-            "⏳ 等待网页完成弹窗初始化..."
+            "⏳ Cloudflare 后等待页面更新..."
         )
+
 
         time.sleep(5)
 
 
         # ----------------------------------------------------
-        # 输出当前页面状态
+        # 当前 URL
         # ----------------------------------------------------
 
         log(
@@ -1131,367 +1101,227 @@ def renew_service(page):
 
 
         # ----------------------------------------------------
-        # 查找 Create Invoice
+        # 等待 Create Invoice 或 Pay Now
         # ----------------------------------------------------
 
-        log(
-            "🔎 开始寻找 Create Invoice..."
+        result_type, element = (
+            wait_create_invoice_or_pay_now(
+                page,
+                timeout=30
+            )
         )
 
 
-        create_invoice = wait_for_create_invoice(
-            page,
-            timeout=60
-        )
+        # ====================================================
+        # 情况 A
+        #
+        # 找到 Create Invoice
+        # ====================================================
 
-
-        if create_invoice is None:
+        if result_type == "create_invoice":
 
             log(
-                "❌ 60 秒内没有找到可点击的 "
-                "Create Invoice"
+                "🎯 按照正常流程点击 Create Invoice"
             )
 
 
-            # 输出当前页面中所有按钮文字
+            if not click_element(
+                element,
+                "Create Invoice"
+            ):
+
+                return False
+
+
+            log(
+                "⏳ 等待 Invoice 创建..."
+            )
+
+
+            time.sleep(6)
+
+
+            handle_cloudflare(
+                page,
+                timeout=30
+            )
+
+
+            time.sleep(3)
+
+
+        # ====================================================
+        # 情况 B
+        #
+        # 没有 Create Invoice，但是已经有 Pay Now
+        # ====================================================
+
+        elif result_type == "pay_now":
+
+            log(
+                "🎯 页面没有 Create Invoice，"
+                "但已经出现 Pay Now。"
+            )
+
+
+            log(
+                "✅ 判断：Invoice 已经创建。"
+            )
+
+
+        # ====================================================
+        # 情况 C
+        # ====================================================
+
+        else:
+
+            log(
+                "❌ 30 秒内既没有找到 "
+                "Create Invoice，也没有找到 Pay Now"
+            )
+
+
+            debug_buttons(page)
+
+
+            # 打印页面关键文字
             try:
 
+                body = page.locator(
+                    "body"
+                ).inner_text()
+
+
                 log(
-                    "🔍 当前页面可见按钮："
+                    "🔍 当前页面关键内容："
                 )
 
 
-                buttons = page.locator(
-                    "button:visible"
+                log(
+                    body[:5000]
                 )
-
-
-                for i in range(
-                    min(buttons.count(), 50)
-                ):
-
-                    try:
-
-                        txt = buttons.nth(i).inner_text().strip()
-
-                        if txt:
-
-                            log(
-                                f"   BUTTON[{i}]: "
-                                f"{txt}"
-                            )
-
-                    except Exception:
-
-                        continue
 
 
             except Exception:
                 pass
 
 
-            # 输出弹窗文字
-            try:
-
-                log(
-                    "🔍 当前可见弹窗内容："
-                )
-
-
-                modals = page.locator(
-                    "div.modal.show:visible, "
-                    "div.modal.fade.show:visible, "
-                    '[role="dialog"]:visible'
-                )
-
-
-                for i in range(
-                    modals.count()
-                ):
-
-                    try:
-
-                        txt = (
-                            modals.nth(i)
-                            .inner_text()
-                            .strip()
-                        )
-
-                        if txt:
-
-                            log(
-                                "----- 弹窗 -----"
-                            )
-
-                            log(txt[:3000])
-
-                    except Exception:
-                        continue
-
-
-            except Exception:
-                pass
-
-
-            # 截图
-            try:
-
-                path = (
-                    "/tmp/"
-                    "hidencloud_create_invoice_not_found.png"
-                )
-
-
-                page.screenshot(
-                    path=path,
-                    full_page=True
-                )
-
-
-                log(
-                    f"📸 已保存截图：{path}"
-                )
-
-            except Exception as e:
-
-                log(
-                    f"⚠️ 保存截图失败：{e}"
-                )
+            save_screenshot(
+                page,
+                "hidencloud_invoice_not_found.png"
+            )
 
 
             return False
 
 
-        # ----------------------------------------------------
-        # 点击 Create Invoice
-        # ----------------------------------------------------
+        # ====================================================
+        # 到这里：
+        #
+        # Invoice 已经创建
+        #
+        # 现在重新查找 Pay Now
+        # ====================================================
 
         log(
-            "🖱️ 点击 Create Invoice..."
+            "🔎 检查 Pay Now..."
         )
 
 
-        try:
+        pay_now = None
 
-            create_invoice.scroll_into_view_if_needed(
-                timeout=10000
+
+        for _ in range(30):
+
+            pay_now = find_pay_now(
+                page
             )
 
-        except Exception:
-            pass
+
+            if pay_now:
+
+                break
 
 
-        time.sleep(1)
+            time.sleep(1)
 
 
-        try:
+        # ====================================================
+        # 如果存在 Pay Now
+        # ====================================================
 
-            create_invoice.click(
-                timeout=15000
-            )
-
-        except Exception as e:
+        if pay_now:
 
             log(
-                f"⚠️ 普通点击失败：{e}"
+                "💳 检测到 Pay Now"
             )
 
-            # 重新定位一次
-            create_invoice = wait_for_create_invoice(
-                page,
-                timeout=10
-            )
-
-
-            if create_invoice is None:
-
-                log(
-                    "❌ Create Invoice 重新定位失败"
-                )
-
-                return False
-
-
-            create_invoice.click(
-                timeout=15000
-            )
-
-
-        log(
-            "✅ Create Invoice 点击完成！"
-        )
-
-
-        # ----------------------------------------------------
-        # 等待创建发票
-        # ----------------------------------------------------
-
-        log(
-            "⏳ 等待发票创建..."
-        )
-
-
-        time.sleep(5)
-
-
-        # 等待导航
-        try:
-
-            page.wait_for_load_state(
-                "domcontentloaded",
-                timeout=15000
-            )
-
-        except Exception:
-
-            pass
-
-
-        handle_cloudflare(page)
-
-
-        time.sleep(3)
-
-
-        log(
-            f"📍 Create Invoice 后 URL："
-            f"{page.url}"
-        )
-
-
-        # ----------------------------------------------------
-        # 如果直接进入 Invoice
-        # ----------------------------------------------------
-
-        if "/payment/invoice/" in page.url:
 
             log(
-                "🎉 已进入 Invoice 页面！"
-            )
-
-            return True
-
-
-        # ----------------------------------------------------
-        # 如果网页自动出现 Invoice 链接
-        # ----------------------------------------------------
-
-        try:
-
-            invoice_links = page.locator(
-                'a[href*="/payment/invoice/"]'
+                "🖱️ 点击 Pay Now..."
             )
 
 
-            for i in range(
-                invoice_links.count()
+            if not click_element(
+                pay_now,
+                "Pay Now"
             ):
 
-                link = invoice_links.nth(i)
+                log(
+                    "⚠️ Pay Now 点击失败"
+                )
+
+
+            else:
+
+                log(
+                    "⏳ 等待支付/续期结果..."
+                )
+
+
+                time.sleep(6)
 
 
                 try:
 
-                    if not link.is_visible():
-
-                        continue
-
-
-                    target_url = (
-                        link.get_attribute(
-                            "href"
-                        )
+                    page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=15000
                     )
 
-
-                    if target_url:
-
-                        log(
-                            f"🧾 找到 Invoice："
-                            f"{target_url}"
-                        )
-
-
-                        page.goto(
-                            target_url,
-                            wait_until="domcontentloaded",
-                            timeout=60000
-                        )
-
-
-                        handle_cloudflare(page)
-
-
-                        time.sleep(3)
-
-
-                        if (
-                            "/payment/invoice/"
-                            in page.url
-                        ):
-
-                            log(
-                                "🎉 已进入 Invoice 页面！"
-                            )
-
-                            return True
-
-
                 except Exception:
-
-                    continue
-
-
-        except Exception:
-            pass
+                    pass
 
 
-        # ----------------------------------------------------
-        # 检查成功文字
-        # ----------------------------------------------------
-
-        body = get_body_text(page)
-
-
-        success_keywords = [
-
-            "Invoice Created",
-
-            "Invoice created",
-
-            "Invoice",
-
-            "invoice",
-
-            "Success",
-
-            "success",
-
-            "Created",
-
-            "created"
-
-        ]
-
-
-        for keyword in success_keywords:
-
-            if keyword in body:
-
-                log(
-                    f"✅ 页面检测到结果："
-                    f"{keyword}"
+                handle_cloudflare(
+                    page,
+                    timeout=30
                 )
 
-                return True
+
+                time.sleep(4)
 
 
-        # ----------------------------------------------------
-        # 最后刷新服务器页面
-        # ----------------------------------------------------
+                log(
+                    f"📍 Pay Now 后 URL："
+                    f"{page.url}"
+                )
+
+
+        else:
+
+            log(
+                "ℹ️ 当前没有 Pay Now，"
+                "可能 Invoice 创建后已经自动完成续期。"
+            )
+
+
+        # ====================================================
+        # 最终回到服务器页面
+        # ====================================================
 
         log(
-            "🔄 刷新服务器页面检查续期结果..."
+            "🔄 返回服务器管理页面..."
         )
 
 
@@ -1502,28 +1332,47 @@ def renew_service(page):
         )
 
 
-        handle_cloudflare(page)
+        handle_cloudflare(
+            page,
+            timeout=30
+        )
 
 
-        time.sleep(4)
+        time.sleep(5)
 
 
-        new_due = get_due_date(page)
+        # ====================================================
+        # 获取当前 Due Date
+        # ====================================================
+
+        current_due = get_due_date(
+            page
+        )
 
 
         log(
             f"📅 当前 Due Date："
-            f"{new_due}"
+            f"{current_due}"
         )
 
 
-        if new_due != "未知":
+        # ====================================================
+        # 这里只判断流程有没有完成
+        #
+        # old_due 与 new_due 的最终判断放 main()
+        # ====================================================
+
+        if current_due != "未知":
+
+            log(
+                "✅ 续期流程执行完成"
+            )
 
             return True
 
 
         log(
-            "❌ 没有检测到续期结果"
+            "❌ 无法读取续期后的 Due Date"
         )
 
         return False
@@ -1532,35 +1381,14 @@ def renew_service(page):
     except Exception as e:
 
         log(
-            f"❌ 续费过程异常: {e}"
+            f"❌ 续费过程异常：{e}"
         )
 
 
-        # ----------------------------------------------------
-        # 保存错误截图
-        # ----------------------------------------------------
-
-        try:
-
-            path = (
-                "/tmp/"
-                "hidencloud_renew_error.png"
-            )
-
-
-            page.screenshot(
-                path=path,
-                full_page=True
-            )
-
-
-            log(
-                f"📸 已保存错误截图：{path}"
-            )
-
-
-        except Exception:
-            pass
+        save_screenshot(
+            page,
+            "hidencloud_renew_error.png"
+        )
 
 
         return False
@@ -1576,7 +1404,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # 检查登录凭证
+    # 登录凭证
     # --------------------------------------------------------
 
     if not COOKIE_VALUE and not (
@@ -1590,14 +1418,10 @@ def main():
         sys.exit(1)
 
 
-    # --------------------------------------------------------
-    # Playwright
-    # --------------------------------------------------------
+    browser = None
+
 
     with sync_playwright() as p:
-
-        browser = None
-
 
         try:
 
@@ -1637,12 +1461,11 @@ def main():
                     "--disable-dev-shm-usage",
                     "--window-size=1920,1080"
                 ]
-
             )
 
 
             # ------------------------------------------------
-            # Context
+            # 浏览器 Context
             # ------------------------------------------------
 
             context = browser.new_context(
@@ -1669,7 +1492,6 @@ def main():
                     if IS_PROXY
                     else None
                 )
-
             )
 
 
@@ -1692,14 +1514,14 @@ def main():
             if not login(page):
 
                 log(
-                    "❌ 登录失败，退出"
+                    "❌ 登录失败"
                 )
 
                 sys.exit(1)
 
 
             # ------------------------------------------------
-            # 获取 Server ID
+            # Server ID
             # ------------------------------------------------
 
             server_id = get_server_id(
@@ -1735,7 +1557,7 @@ def main():
 
 
             # ------------------------------------------------
-            # 获取续期前时间
+            # 续期前
             # ------------------------------------------------
 
             old_due = get_due_date(
@@ -1750,20 +1572,20 @@ def main():
 
 
             # ------------------------------------------------
-            # 续期
+            # 执行续期
             # ------------------------------------------------
 
-            renew_result = renew_service(
+            result = renew_service(
                 page
             )
 
 
-            if not renew_result:
+            if not result:
 
                 log(
-                    "❌ Renew → Create Invoice "
-                    "流程失败"
+                    "❌ 续期流程失败"
                 )
+
 
                 send_telegram_notification(
                     "❌ HidenCloud 续期失败",
@@ -1771,23 +1593,24 @@ def main():
                     "未知"
                 )
 
+
                 sys.exit(1)
 
 
             # ------------------------------------------------
-            # 等待服务器状态更新
+            # 等待后台更新
             # ------------------------------------------------
 
             log(
-                "⏳ 等待 HidenCloud 更新服务器状态..."
+                "⏳ 等待 HidenCloud 更新 Due Date..."
             )
 
 
-            time.sleep(5)
+            time.sleep(8)
 
 
             # ------------------------------------------------
-            # 返回服务页面
+            # 重新打开服务器页面
             # ------------------------------------------------
 
             page.goto(
@@ -1797,14 +1620,17 @@ def main():
             )
 
 
-            handle_cloudflare(page)
+            handle_cloudflare(
+                page,
+                timeout=30
+            )
 
 
-            time.sleep(3)
+            time.sleep(5)
 
 
             # ------------------------------------------------
-            # 获取续期后日期
+            # 获取续期后时间
             # ------------------------------------------------
 
             new_due = get_due_date(
@@ -1813,41 +1639,58 @@ def main():
 
 
             log(
-                f"📆 续费后到期时间："
+                f"📆 续期后到期时间："
                 f"{new_due}"
             )
 
 
             # ------------------------------------------------
-            # 判断
+            # 最终判断
             # ------------------------------------------------
 
             if (
-                old_due != new_due
+                old_due != "未知"
                 and new_due != "未知"
+                and old_due != new_due
             ):
 
                 status = (
-                    "✅ 续期成功"
+                    "✅ HidenCloud 续期成功"
                 )
 
-                renew_exit_code = 0
+                exit_code = 0
+
 
                 log(
-                    "🎉 HidenCloud 续期成功！"
+                    "🎉🎉🎉 续期成功！"
+                )
+
+
+                log(
+                    f"📅 {old_due} → {new_due}"
                 )
 
 
             else:
 
                 status = (
-                    "❌ 续期失败或时间未变"
+                    "❌ HidenCloud 续期失败"
                 )
 
-                renew_exit_code = 1
+                exit_code = 1
+
 
                 log(
-                    "❌ Due Date 没有发生变化"
+                    "❌ Due Date 没有变化"
+                )
+
+
+                log(
+                    f"旧日期：{old_due}"
+                )
+
+                log(
+                    f"新日期：{new_due}"
                 )
 
 
@@ -1863,14 +1706,14 @@ def main():
 
 
             sys.exit(
-                renew_exit_code
+                exit_code
             )
 
 
         except Exception as e:
 
             log(
-                f"❌ 运行报错：{e}"
+                f"❌ 程序运行异常：{e}"
             )
 
 
@@ -1878,14 +1721,9 @@ def main():
 
                 if "page" in locals():
 
-                    page.screenshot(
-                        path="/tmp/"
-                             "hidencloud_fatal_error.png",
-                        full_page=True
-                    )
-
-                    log(
-                        "📸 已保存最终错误截图"
+                    save_screenshot(
+                        page,
+                        "hidencloud_fatal_error.png"
                     )
 
             except Exception:
