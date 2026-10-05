@@ -171,58 +171,200 @@ def get_due_date(page):
 def renew_service(page):
     try:
         log("➡ 进入续期流程...")
+
+        # 确保在服务器管理页面
         if page.url != SERVICE_URL:
-            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-
-        # 检查未使用的 Invoice 链接（避免重复创建）
-        invoice_link = page.locator('a[href*="/payment/invoice/"]').first
-        if invoice_link.count() > 0 and invoice_link.is_visible():
-            target_url = invoice_link.get_attribute("href")
-            log(f"💡 发现已有未支付的发票: {target_url}")
-            page.goto(target_url)
-        else:
-            # 请求后端直接生成发票 POST
-            log("🚀 尝试通过 API 请求发起发票生成...")
-            csrf_token = page.locator('meta[name="csrf-token"]').get_attribute('content') if page.locator('meta[name="csrf-token"]').count() > 0 else ""
-            
-            # 使用 context API 提交请求
-            response = page.request.post(
-                f"{SERVICE_URL}/renew",
-                headers={
-                    "x-csrf-token": csrf_token,
-                    "referer": SERVICE_URL
-                }
+            page.goto(
+                SERVICE_URL,
+                wait_until="domcontentloaded",
+                timeout=60000
             )
-            log(f"📝 续费 API 响应状态: {response.status}")
 
-            time.sleep(3)
-            page.reload()
-            handle_cloudflare(page)
+        time.sleep(2)
 
-        # 再次查找 Pay 按钮或订单链接
-        log("🔎 寻找结算发票页面...")
-        page.goto(f"{BASE_URL}/invoices", wait_until="domcontentloaded", timeout=60000)
+        # ---------------------------------------------------------
+        # 第一步：寻找并点击 Renew
+        # ---------------------------------------------------------
+        log("🔎 寻找 Renew 按钮...")
+
+        renew_btn = page.locator(
+            'button:has-text("Renew"), '
+            'a:has-text("Renew")'
+        ).filter(visible=True).first
+
+        try:
+            renew_btn.wait_for(
+                state="visible",
+                timeout=15000
+            )
+        except Exception:
+            # 备用：通过文字寻找
+            renew_btn = page.get_by_text(
+                "Renew",
+                exact=True
+            ).filter(visible=True).first
+
+            renew_btn.wait_for(
+                state="visible",
+                timeout=15000
+            )
+
+        log("🖱️ 点击 Renew...")
+        renew_btn.click()
+
+        log("✅ Renew 点击完成，等待续期弹窗...")
+
+        # 给 Bootstrap / JS 弹窗一点加载时间
+        time.sleep(2)
+
+        # ---------------------------------------------------------
+        # 第二步：等待 Cloudflare
+        # ---------------------------------------------------------
+        log("🛡️ 检查 Cloudflare 验证...")
+
+        cf_passed = handle_cloudflare(page)
+
+        if cf_passed:
+            log("✅ Cloudflare 验证完成！")
+        else:
+            log("⚠️ Cloudflare 验证未检测到自动完成状态，继续等待页面...")
+
+        # Cloudflare / 弹窗 JS 可能还需要一点时间
+        time.sleep(3)
+
+        # ---------------------------------------------------------
+        # 第三步：寻找 Create Invoice
+        # ---------------------------------------------------------
+        log("🔎 寻找 Create Invoice 按钮...")
+
+        create_invoice = page.locator(
+            'button:has-text("Create Invoice"), '
+            'a:has-text("Create Invoice"), '
+            'input[type="submit"][value*="Create Invoice"]'
+        ).filter(visible=True).first
+
+        try:
+            create_invoice.wait_for(
+                state="visible",
+                timeout=30000
+            )
+        except Exception:
+            log("⚠️ 第一种方式没有找到 Create Invoice，尝试备用定位...")
+
+            create_invoice = page.get_by_text(
+                "Create Invoice",
+                exact=True
+            ).filter(visible=True).first
+
+            create_invoice.wait_for(
+                state="visible",
+                timeout=30000
+            )
+
+        log("✅ 找到 Create Invoice")
+        log("🖱️ 点击 Create Invoice...")
+
+        create_invoice.click()
+
+        log("✅ Create Invoice 点击完成！")
+
+        # ---------------------------------------------------------
+        # 第四步：等待发票创建 / 页面跳转
+        # ---------------------------------------------------------
+        log("⏳ 等待发票创建...")
+
+        time.sleep(5)
+
+        # 等待页面完成导航或 DOM 更新
+        try:
+            page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=15000
+            )
+        except Exception:
+            pass
+
+        # 再处理一次可能出现的 Cloudflare
         handle_cloudflare(page)
 
-        unpaid_invoice = page.locator('a[href*="/payment/invoice/"]').first
-        if unpaid_invoice.count() > 0:
-            unpaid_invoice.click()
-            handle_cloudflare(page)
+        time.sleep(3)
 
-            log("🔎 查找 'Pay' 按钮...")
-            pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible, form button[type="submit"]:visible').first
-            pay_btn.wait_for(state="visible", timeout=15000)
-            pay_btn.click()
-            log("✅ 'Pay' 点击完成！")
-            time.sleep(5)
+        log(f"📍 当前页面：{page.url}")
+
+        # ---------------------------------------------------------
+        # 第五步：判断是否已经进入 Invoice
+        # ---------------------------------------------------------
+        if "/payment/invoice/" in page.url:
+            log("🎉 已进入 Invoice 页面！")
             return True
-        else:
-            log("⚠️ 未在账单列表中找到未支付发票。")
-            return False
+
+        # 如果没有自动跳转，尝试寻找 Invoice 链接
+        invoice_link = page.locator(
+            'a[href*="/payment/invoice/"]:visible'
+        ).first
+
+        if invoice_link.count() > 0:
+            try:
+                invoice_link.wait_for(
+                    state="visible",
+                    timeout=10000
+                )
+
+                target_url = invoice_link.get_attribute("href")
+
+                if target_url:
+                    log(f"🧾 找到 Invoice：{target_url}")
+                    page.goto(
+                        target_url,
+                        wait_until="domcontentloaded",
+                        timeout=60000
+                    )
+
+                    handle_cloudflare(page)
+
+                    time.sleep(3)
+
+                    log("🎉 已进入 Invoice 页面！")
+                    return True
+
+            except Exception as e:
+                log(f"⚠️ Invoice 链接处理失败：{e}")
+
+        # ---------------------------------------------------------
+        # 第六步：检查页面是否出现成功提示
+        # ---------------------------------------------------------
+        body = page.locator("body").inner_text()
+
+        success_keywords = [
+            "Invoice",
+            "invoice",
+            "Created",
+            "created successfully",
+            "Success",
+            "success"
+        ]
+
+        for keyword in success_keywords:
+            if keyword in body:
+                log(f"✅ 页面检测到成功信息：{keyword}")
+                return True
+
+        log("❌ Create Invoice 后没有检测到成功结果。")
+        return False
 
     except Exception as e:
         log(f"❌ 续费过程异常: {e}")
+
+        # 出错时截图，方便 GitHub Actions 排查
+        try:
+            page.screenshot(
+                path="/tmp/hidencloud_renew_error.png",
+                full_page=True
+            )
+            log("📸 已保存错误截图：/tmp/hidencloud_renew_error.png")
+        except Exception:
+            pass
+
         return False
 
 def main():
