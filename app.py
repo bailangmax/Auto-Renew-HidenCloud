@@ -1,1516 +1,729 @@
-import os
-import re
-import time
-import asyncio
-import traceback
-from datetime import datetime
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import requests
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+import os,re,sys,time,random,requests
+try:
+    from patchright.sync_api import sync_playwright
+    USING_PATCHRIGHT = True
+except ImportError:
+    from playwright.sync_api import sync_playwright
+    USING_PATCHRIGHT = False
 
-
-# ============================================================
-# HidenCloud 自动续期
-# ============================================================
+# --- 环境变量 (可在Settings里设置secrets或者私库直接填写在双引号里)---
+COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
+EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用, 必填
+PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用, 必填
+TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
+TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选 
 
 BASE_URL = "https://dash.hidencloud.com"
+LOGIN_URL = f"{BASE_URL}/auth/login"
 
-# 你的服务器
-SERVICE_ID = os.getenv("HIDENCLOUD_SERVICE_ID", "227636")
+# --- 代理配置（由工作流 shell 脚本写入 $GITHUB_ENV）---
+IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
+PROXY_SERVER  = os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081"
+REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
-SERVICE_URL = os.getenv(
-    "HIDENCLOUD_SERVICE_URL",
-    f"{BASE_URL}/service/{SERVICE_ID}/manage"
-)
+# Cloudflare 整页挑战 / Turnstile 组件共用的 iframe 选择器
+CF_IFRAME_SELECTOR = 'iframe[src*="challenges.cloudflare.com"]'
 
-# Cookie
-HIDENCLOUD_COOKIE = os.getenv("HIDENCLOUD_COOKIE", "")
+# 按运行平台选择 UA
+if sys.platform == 'win32':
+    DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+else:
+    DEFAULT_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
 
-# Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# 是否无头
-HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
-
-# 代理，可选
-PROXY_SERVER = os.getenv("PROXY_SERVER", "").strip()
-
-# 等待时间
-CLOUDFLARE_WAIT = 10
-PAY_WAIT = 15
-
-
-# ============================================================
 # 日志
-# ============================================================
+def log(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
-def log(msg):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {msg}", flush=True)
+STEALTH_JS = """
+// 注意：使用真实 Chrome（channel="chrome"）时不要覆盖 window.chrome，
+// 否则会丢失 app/csi/loadTimes 等真实特征，反而更容易被 Cloudflare 识别。
+try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+} catch (e) {}
+"""
 
-
-# ============================================================
-# Telegram
-# ============================================================
-
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("⚠️ 未配置 Telegram，跳过通知")
-        return
-
+def get_current_ip(proxy_server=None):
+    """获取当前出口IP"""
+    proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
-        url = (
-            f"https://api.telegram.org/bot"
-            f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-        )
-
-        requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-            },
-            timeout=20,
-        )
-
-        log("📨 Telegram 通知发送成功")
-
+        resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+        # log(f"请求出口IP完成, status={resp.status_code}")
+        if resp.status_code == 200:
+            return resp.text.strip()
+        return "获取失败"
     except Exception as e:
-        log(f"⚠️ Telegram 发送失败：{e}")
+        log(f"❌ 获取出口IP失败: {e}")
+        return "获取失败"
 
+def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
+    """发送 Telegram 通知"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("⚠️ Telegram 未配置，跳过通知")
+        return False
+    
+    # 获取运行时间
+    local_time = time.gmtime(time.time() + 8 * 3600)
+    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+    if '@' in EMAIL:
+        name, domain = EMAIL.split('@', 1)
+        if len(name) > 4:
+            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
+        else:
+            masked_email = f"{name}@{domain}"
+    else:
+        masked_email = EMAIL[:2] + '****'
 
-# ============================================================
-# Cookie
-# ============================================================
-
-def build_cookie():
-    """
-    支持：
-
-    HIDENCLOUD_COOKIE=完整cookie值
-
-    如果你的 Cookie 是：
-
-    remember_web_xxxxx=xxxxxxxx
-
-    也可以直接填写整个：
-
-    remember_web_xxxxx=xxxxxxxx
-    """
-
-    if not HIDENCLOUD_COOKIE:
-        return []
-
-    cookie = HIDENCLOUD_COOKIE.strip()
-
-    # 如果用户直接填写 name=value
-    if "=" in cookie:
-        name, value = cookie.split("=", 1)
-
-        return [{
-            "name": name.strip(),
-            "value": value.strip(),
-            "domain": "dash.hidencloud.com",
-            "path": "/",
-            "secure": True,
-        }]
-
-    # 兼容以前的 HidenCloud remember cookie
-    return [{
-        "name": "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989",
-        "value": cookie,
-        "domain": "dash.hidencloud.com",
-        "path": "/",
-        "secure": True,
-    }]
-
-
-# ============================================================
-# Cloudflare
-# ============================================================
-
-async def wait_cloudflare(page, timeout=30):
-    """
-    不绕过 Cloudflare。
-    这里只等待网站自己的验证完成。
-    """
-
-    start = time.time()
-
-    while time.time() - start < timeout:
-
-        try:
-            url = page.url.lower()
-
-            content = await page.locator("body").inner_text(
-                timeout=3000
-            )
-
-            cf_text = (
-                "checking your browser" in content.lower()
-                or "verify you are human" in content.lower()
-                or "just a moment" in content.lower()
-                or "checking your browser before accessing" in content.lower()
-            )
-
-            challenge_frame = False
-
-            for frame in page.frames:
-                frame_url = frame.url.lower()
-
-                if (
-                    "challenges.cloudflare.com" in frame_url
-                    or "challenge-platform" in frame_url
-                ):
-                    challenge_frame = True
-                    break
-
-            if not cf_text and not challenge_frame:
-                log("✅ 未检测到 Cloudflare Challenge")
-                return True
-
-            log("⏳ 检测到 Cloudflare Challenge，等待验证...")
-
-        except Exception:
-            pass
-
-        await asyncio.sleep(2)
-
-    log("⚠️ Cloudflare 等待超时，继续执行")
-    return False
-
-
-# ============================================================
-# 获取 Due Date
-# ============================================================
-
-async def get_due_date(page):
+    text = (
+        f"🎉 HidenCloud 续期通知\n\n"
+        f"{status}\n"
+        f"👤 账号: {masked_email}\n"
+        f"📅 续期前到期：{old_due}\n"
+        f"📅 续期后到期：{new_due}\n"
+        f"🌐 续期使用IP: {current_ip}\n"
+        f"🕒 续期时间：{now}"
+    )
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    }
     try:
-        await page.wait_for_load_state(
-            "domcontentloaded",
-            timeout=15000
+        resp = requests.post(url, json=payload, timeout=10, proxies=REQUESTS_PROXIES)
+        if resp.status_code == 200:
+            log("✅ Telegram 通知发送成功")
+            return True
+        else:
+            log(f"❌ Telegram 通知失败: {resp.text}")
+            return False
+    except Exception as e:
+        log(f"❌ Telegram 通知异常: {e}")
+        return False
+
+def _get_turnstile_token(page):
+    """读取 Turnstile 验证通过后生成的响应 token，未通过时返回 None"""
+    try:
+        return page.evaluate(
+            """
+            () => {
+                try {
+                    if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                        let t = null;
+                        try { t = window.turnstile.getResponse(); } catch (e) {}
+                        if (t && t.length > 30) return t;
+                        for (let i = 0; i < 5; i++) {
+                            try { t = window.turnstile.getResponse(String(i)); } catch (e) { t = null; }
+                            if (t && t.length > 30) return t;
+                        }
+                    }
+                } catch (e) {}
+                const inputs = document.querySelectorAll(
+                    'input[name="cf-turnstile-response"], input[id$="_response"]'
+                );
+                for (const el of inputs) {
+                    if (el.value && el.value.length > 30) return el.value;
+                }
+                return null;
+            }
+            """
         )
     except Exception:
-        pass
+        return None
 
+def _find_visible_cf_frames(page):
+    """返回当前可见且有实际尺寸的 Cloudflare 挑战/Turnstile iframe（后出现的排最后，弹窗内的通常在最后）"""
+    result = []
     try:
-        text = await page.locator("body").inner_text(timeout=10000)
-
-        # 常见：
-        # Due Date
-        # 05 Oct 2026
-        #
-        # 也兼容：
-        # Due Date: 05 Oct 2026
-
-        patterns = [
-            r"Due Date\s*[:\-]?\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
-            r"Due\s*Date\s*[:\-]?\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
-        ]
-
-        for pattern in patterns:
-            match = re.search(
-                pattern,
-                text,
-                re.IGNORECASE
-            )
-
-            if match:
-                return match.group(1).strip()
-
-    except Exception as e:
-        log(f"⚠️ 获取 Due Date 失败：{e}")
-
-    return None
-
-
-# ============================================================
-# 截图
-# ============================================================
-
-async def screenshot(page, filename):
-    try:
-        path = f"/tmp/{filename}"
-
-        await page.screenshot(
-            path=path,
-            full_page=True
-        )
-
-        log(f"📸 截图保存：{path}")
-
-    except Exception as e:
-        log(f"⚠️ 截图失败：{e}")
-
-
-# ============================================================
-# DOM 调试
-# ============================================================
-
-async def debug_buttons(page):
-    """
-    打印所有 Frame 中的按钮和链接。
-    """
-
-    log("🔎 开始扫描当前页面所有按钮...")
-
-    for frame_index, frame in enumerate(page.frames):
-
-        try:
-            log(
-                f"📄 Frame[{frame_index}] "
-                f"URL: {frame.url}"
-            )
-
-            elements = await frame.locator(
-                "button, a, input[type='button'], "
-                "input[type='submit']"
-            ).all()
-
-            index = 0
-
-            for element in elements:
-
-                try:
-
-                    if not await element.is_visible():
-                        continue
-
-                    index += 1
-
-                    text = ""
-
-                    try:
-                        text = await element.inner_text(
-                            timeout=1000
-                        )
-                    except Exception:
-                        pass
-
-                    if not text:
-                        try:
-                            text = await element.get_attribute(
-                                "value"
-                            )
-                        except Exception:
-                            pass
-
-                    href = ""
-
-                    try:
-                        href = await element.get_attribute(
-                            "href"
-                        )
-                    except Exception:
-                        pass
-
-                    log(
-                        f"  [{index}] "
-                        f"{text.strip()[:100]} "
-                        f"href={href}"
-                    )
-
-                except Exception:
-                    continue
-
-        except Exception:
-            continue
-
-
-# ============================================================
-# 查找文字元素
-# ============================================================
-
-async def find_text_element(page, text):
-    """
-    在所有 frame 中寻找文字。
-    """
-
-    selectors = [
-        f"button:has-text('{text}')",
-        f"a:has-text('{text}')",
-        f"[role='button']:has-text('{text}')",
-        f"input[value*='{text}']",
-    ]
-
-    for frame in page.frames:
-
-        for selector in selectors:
-
+        for handle in page.query_selector_all(CF_IFRAME_SELECTOR):
             try:
-
-                locator = frame.locator(selector).first
-
-                count = await locator.count()
-
-                if count == 0:
-                    continue
-
-                if await locator.is_visible():
-                    return locator
-
+                box = handle.bounding_box()
+                if box and box['width'] > 10 and box['height'] > 10:
+                    result.append(handle)
             except Exception:
                 continue
-
-    return None
-
-
-# ============================================================
-# 强力点击
-# ============================================================
-
-async def force_click(locator, name="按钮"):
-    """
-    解决：
-
-    Element is outside of the viewport
-
-    使用三级点击。
-    """
-
-    # --------------------------------------------------------
-    # 方法 1：force=True
-    # --------------------------------------------------------
-
-    try:
-
-        log(f"🖱️ {name}：尝试 force=True 点击...")
-
-        await locator.click(
-            force=True,
-            timeout=10000
-        )
-
-        log(f"✅ {name} force 点击成功")
-
-        return True
-
-    except Exception as e:
-
-        log(
-            f"⚠️ {name} force 点击失败："
-            f"{str(e)[:300]}"
-        )
-
-    # --------------------------------------------------------
-    # 方法 2：DOM click
-    # --------------------------------------------------------
-
-    try:
-
-        log(f"🖱️ {name}：尝试 JavaScript click()...")
-
-        await locator.evaluate(
-            """
-            element => {
-                element.scrollIntoView({
-                    block: 'center',
-                    inline: 'center'
-                });
-
-                element.click();
-            }
-            """
-        )
-
-        log(f"✅ {name} JavaScript click 成功")
-
-        return True
-
-    except Exception as e:
-
-        log(
-            f"⚠️ {name} JavaScript click 失败："
-            f"{str(e)[:300]}"
-        )
-
-    # --------------------------------------------------------
-    # 方法 3：完整 MouseEvent
-    # --------------------------------------------------------
-
-    try:
-
-        log(f"🖱️ {name}：尝试 JS MouseEvent...")
-
-        await locator.evaluate(
-            """
-            element => {
-
-                element.scrollIntoView({
-                    block: 'center',
-                    inline: 'center'
-                });
-
-                const events = [
-                    'pointerover',
-                    'mouseover',
-                    'pointerdown',
-                    'mousedown',
-                    'pointerup',
-                    'mouseup',
-                    'click'
-                ];
-
-                for (const eventName of events) {
-
-                    element.dispatchEvent(
-                        new MouseEvent(eventName, {
-                            bubbles: true,
-                            cancelable: true,
-                            view: window
-                        })
-                    );
-
-                }
-            }
-            """
-        )
-
-        log(f"✅ {name} JS MouseEvent 成功")
-
-        return True
-
-    except Exception as e:
-
-        log(
-            f"❌ {name} 所有点击方式均失败："
-            f"{str(e)[:300]}"
-        )
-
-        return False
-
-
-# ============================================================
-# 查找 Create Invoice
-# ============================================================
-
-async def find_create_invoice(page):
-
-    log("🔎 寻找 Create Invoice...")
-
-    return await find_text_element(
-        page,
-        "Create Invoice"
-    )
-
-
-# ============================================================
-# 查找 Pay Now
-# ============================================================
-
-async def find_pay_now(page):
-
-    log("🔎 寻找 Pay Now...")
-
-    locator = await find_text_element(
-        page,
-        "Pay Now"
-    )
-
-    if locator:
-        log("💳 检测到 Pay Now")
-
-    return locator
-
-
-# ============================================================
-# 点击 Renew
-# ============================================================
-
-async def click_renew(page):
-
-    log("🔎 寻找 Renew 按钮...")
-
-    locator = await find_text_element(
-        page,
-        "Renew"
-    )
-
-    if not locator:
-
-        log("❌ 没有找到 Renew")
-
-        await debug_buttons(page)
-
-        await screenshot(
-            page,
-            "hidencloud_renew_button_not_found.png"
-        )
-
-        return False
-
-    log("✅ 找到 Renew 按钮")
-
-    ok = await force_click(
-        locator,
-        "Renew"
-    )
-
-    if not ok:
-        return False
-
-    log("✅ Renew 点击完成")
-    log("⏳ 等待续期弹窗 / Invoice 状态...")
-
-    await asyncio.sleep(5)
-
-    await wait_cloudflare(
-        page,
-        timeout=30
-    )
-
-    return True
-
-
-# ============================================================
-# 查找 Invoice / Pay Now
-# ============================================================
-
-async def wait_invoice_state(page, timeout=30):
-
-    log("🔎 等待 Create Invoice / Pay Now...")
-
-    start = time.time()
-
-    while time.time() - start < timeout:
-
-        # Create Invoice
-        create_invoice = await find_create_invoice(page)
-
-        if create_invoice:
-
-            log("✅ 检测到 Create Invoice！")
-
-            return "create_invoice", create_invoice
-
-        # Pay Now
-        pay_now = await find_pay_now(page)
-
-        if pay_now:
-
-            log("✅ 检测到 Pay Now！")
-            log("💡 当前页面已经存在付款按钮，说明 Invoice 已经生成。")
-
-            return "pay_now", pay_now
-
-        await asyncio.sleep(1)
-
-    return None, None
-
-
-# ============================================================
-# 点击 Create Invoice
-# ============================================================
-
-async def click_create_invoice(page, locator):
-
-    log("🧾 点击 Create Invoice...")
-
-    ok = await force_click(
-        locator,
-        "Create Invoice"
-    )
-
-    if not ok:
-        return False
-
-    log("⏳ Create Invoice 已点击，等待页面变化...")
-
-    await asyncio.sleep(5)
-
-    await wait_cloudflare(
-        page,
-        timeout=30
-    )
-
-    return True
-
-
-# ============================================================
-# 点击 Pay Now
-# ============================================================
-
-async def click_pay_now(page, locator):
-
-    log("💳 准备点击 Pay Now...")
-
-    # --------------------------------------------------------
-    # 记录点击前状态
-    # --------------------------------------------------------
-
-    before_url = page.url
-
-    log(f"📍 点击前 URL：{before_url}")
-
-    # --------------------------------------------------------
-    # 获取按钮信息
-    # --------------------------------------------------------
-
-    try:
-
-        info = await locator.evaluate(
-            """
-            element => {
-
-                const rect =
-                    element.getBoundingClientRect();
-
-                return {
-                    text: element.innerText,
-                    disabled: element.disabled,
-                    type: element.type,
-                    formAction:
-                        element.form
-                        ? element.form.action
-                        : null,
-                    formMethod:
-                        element.form
-                        ? element.form.method
-                        : null,
-                    rect: {
-                        x: rect.x,
-                        y: rect.y,
-                        width: rect.width,
-                        height: rect.height
-                    },
-                    html: element.outerHTML
-                };
-            }
-            """
-        )
-
-        log(
-            f"🔍 Pay Now DOM 信息："
-            f"{info}"
-        )
-
-    except Exception as e:
-
-        log(
-            f"⚠️ 获取 Pay Now DOM 信息失败：{e}"
-        )
-
-    # ========================================================
-    # 第一种：force click
-    # ========================================================
-
-    try:
-
-        log("🖱️ Pay Now：尝试 force=True...")
-
-        await locator.click(
-            force=True,
-            timeout=10000
-        )
-
-        log("✅ Pay Now force=True 点击成功")
-
-        await asyncio.sleep(5)
-
-        return True
-
-    except Exception as e:
-
-        log(
-            f"⚠️ Pay Now force 点击失败："
-            f"{str(e)[:500]}"
-        )
-
-    # ========================================================
-    # 第二种：DOM click
-    # ========================================================
-
-    try:
-
-        log("🖱️ Pay Now：尝试 JavaScript element.click()...")
-
-        await locator.evaluate(
-            """
-            element => {
-
-                element.scrollIntoView({
-                    block: 'center',
-                    inline: 'center'
-                });
-
-                element.click();
-            }
-            """
-        )
-
-        log("✅ Pay Now JavaScript click 成功")
-
-        await asyncio.sleep(5)
-
-        return True
-
-    except Exception as e:
-
-        log(
-            f"⚠️ Pay Now JS click 失败："
-            f"{str(e)[:500]}"
-        )
-
-    # ========================================================
-    # 第三种：submit form
-    #
-    # 你的按钮明确是：
-    #
-    # <button type="submit">
-    #
-    # 所以这里直接提交它所属的 form。
-    # ========================================================
-
-    try:
-
-        log("🖱️ Pay Now：尝试直接提交 form...")
-
-        result = await locator.evaluate(
-            """
-            element => {
-
-                const form = element.form;
-
-                if (!form) {
-                    return {
-                        success: false,
-                        reason: "no form"
-                    };
-                }
-
-                form.requestSubmit(element);
-
-                return {
-                    success: true,
-                    action: form.action,
-                    method: form.method
-                };
-            }
-            """
-        )
-
-        log(
-            f"📨 Form submit 结果：{result}"
-        )
-
-        if result.get("success"):
-
-            await asyncio.sleep(8)
-
-            return True
-
-    except Exception as e:
-
-        log(
-            f"⚠️ Pay Now form submit 失败："
-            f"{str(e)[:500]}"
-        )
-
-    # ========================================================
-    # 第四种：完整 MouseEvent
-    # ========================================================
-
-    try:
-
-        log("🖱️ Pay Now：尝试完整 MouseEvent...")
-
-        await locator.evaluate(
-            """
-            element => {
-
-                element.scrollIntoView({
-                    block: 'center',
-                    inline: 'center'
-                });
-
-                const events = [
-                    'pointerover',
-                    'mouseover',
-                    'pointermove',
-                    'mousemove',
-                    'pointerdown',
-                    'mousedown',
-                    'pointerup',
-                    'mouseup',
-                    'click'
-                ];
-
-                for (const name of events) {
-
-                    element.dispatchEvent(
-                        new MouseEvent(name, {
-                            bubbles: true,
-                            cancelable: true,
-                            view: window,
-                            buttons: 1
-                        })
-                    );
-                }
-            }
-            """
-        )
-
-        log("✅ Pay Now MouseEvent 已发送")
-
-        await asyncio.sleep(8)
-
-        return True
-
-    except Exception as e:
-
-        log(
-            f"❌ Pay Now 所有点击方法均失败："
-            f"{str(e)[:500]}"
-        )
-
-    return False
-
-
-# ============================================================
-# 检查付款 / 续期是否成功
-# ============================================================
-
-async def check_payment_success(page):
-
-    log("🔎 检查付款/续期结果...")
-
-    await asyncio.sleep(3)
-
-    url = page.url
-
-    log(f"📍 当前 URL：{url}")
-
-    # --------------------------------------------------------
-    # URL
-    # --------------------------------------------------------
-
-    if "/payment/" in url.lower():
-        log("💳 当前已经进入 Payment 页面")
-        return True
-
-    # --------------------------------------------------------
-    # 页面文字
-    # --------------------------------------------------------
-
-    try:
-
-        text = await page.locator("body").inner_text(
-            timeout=10000
-        )
-
-        lower = text.lower()
-
-        success_words = [
-            "payment successful",
-            "payment completed",
-            "invoice paid",
-            "paid",
-            "renewed",
-            "renewal successful",
-            "successfully renewed",
-        ]
-
-        for word in success_words:
-
-            if word in lower:
-
-                log(
-                    f"✅ 检测到成功状态文字：{word}"
-                )
-
-                return True
-
     except Exception:
         pass
+    return result
 
+def _cf_checkbox_visible(page):
+    """任意 Cloudflare 框架内（含嵌套 iframe）当前是否可见复选框"""
+    for frame in page.frames:
+        if 'challenges.cloudflare.com' not in (frame.url or ''):
+            continue
+        try:
+            if frame.locator('input[type="checkbox"]:visible').count() > 0:
+                return True
+        except Exception:
+            continue
     return False
 
-
-# ============================================================
-# 完整续期
-# ============================================================
-
-async def renew_service(page):
-
-    log("============================================================")
-    log("🚀 开始 HidenCloud 续期")
-    log("============================================================")
-
-    log(f"📍 当前 URL：{page.url}")
-
-    # --------------------------------------------------------
-    # 点击 Renew
-    # --------------------------------------------------------
-
-    if not await click_renew(page):
-
-        log("❌ Renew 点击失败")
-
-        return False
-
-    # --------------------------------------------------------
-    # 等待 Invoice 状态
-    # --------------------------------------------------------
-
-    state, locator = await wait_invoice_state(
-        page,
-        timeout=30
-    )
-
-    # ========================================================
-    # Create Invoice
-    # ========================================================
-
-    if state == "create_invoice":
-
-        log("🎯 检测到 Create Invoice")
-
-        ok = await click_create_invoice(
-            page,
-            locator
-        )
-
-        if not ok:
-
-            log("❌ Create Invoice 点击失败")
-
-            await screenshot(
-                page,
-                "hidencloud_create_invoice_failed.png"
-            )
-
-            return False
-
-        # Create Invoice 后重新寻找 Pay Now
-
-        log("🔎 Create Invoice 后重新寻找 Pay Now...")
-
-        state2, pay_locator = await wait_invoice_state(
-            page,
-            timeout=30
-        )
-
-        if state2 != "pay_now":
-
-            log(
-                "⚠️ Create Invoice 后没有检测到 Pay Now"
-            )
-
-            await debug_buttons(page)
-
-            await screenshot(
-                page,
-                "hidencloud_pay_now_not_found_after_invoice.png"
-            )
-
-            return False
-
-        locator = pay_locator
-
-    # ========================================================
-    # Pay Now
-    # ========================================================
-
-    elif state == "pay_now":
-
-        log("🎯 页面没有 Create Invoice，但已经出现 Pay Now")
-        log("✅ 判断：Invoice 已经创建。")
-
-    else:
-
-        log("❌ 30 秒内没有找到 Create Invoice / Pay Now")
-
-        await debug_buttons(page)
-
-        await screenshot(
-            page,
-            "hidencloud_invoice_state_not_found.png"
-        )
-
-        return False
-
-    # ========================================================
-    # 点击 Pay Now
-    # ========================================================
-
-    log("🔎 检查 Pay Now...")
-
-    pay_locator = await find_pay_now(page)
-
-    if not pay_locator:
-
-        log("❌ Pay Now 不存在")
-
-        await debug_buttons(page)
-
-        await screenshot(
-            page,
-            "hidencloud_pay_now_missing.png"
-        )
-
-        return False
-
-    log("💳 检测到 Pay Now")
-
-    before_url = page.url
-
-    ok = await click_pay_now(
-        page,
-        pay_locator
-    )
-
-    if not ok:
-
-        log("❌ Pay Now 点击最终失败")
-
-        await screenshot(
-            page,
-            "hidencloud_pay_now_click_failed.png"
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # 等待支付页面/结果
-    # --------------------------------------------------------
-
-    log("⏳ Pay Now 点击完成，等待 HidenCloud 响应...")
-
-    await asyncio.sleep(PAY_WAIT)
-
-    await wait_cloudflare(
-        page,
-        timeout=30
-    )
-
-    after_url = page.url
-
-    log(f"📍 点击后 URL：{after_url}")
-
-    if after_url != before_url:
-
-        log("🔄 检测到 URL 发生变化")
-
-    # --------------------------------------------------------
-    # 检查结果
-    # --------------------------------------------------------
-
-    success = await check_payment_success(
-        page
-    )
-
-    if success:
-
-        log("✅ 检测到付款/续期页面状态")
-
-    else:
-
-        log(
-            "⚠️ 暂时没有检测到明确的付款成功文字"
-        )
-
-    return True
-
-
-# ============================================================
-# 主程序
-# ============================================================
-
-async def main():
-
-    old_due_date = None
-    new_due_date = None
-
-    async with async_playwright() as p:
-
-        log("🚀 启动 Chromium...")
-
-        launch_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--window-size=1920,1080",
-        ]
-
-        browser_options = {
-            "headless": HEADLESS,
-            "args": launch_args,
-        }
-
-        if PROXY_SERVER:
-
-            log(
-                f"🌐 使用代理：{PROXY_SERVER}"
-            )
-
-            browser_options["proxy"] = {
-                "server": PROXY_SERVER
-            }
-
-        browser = await p.chromium.launch(
-            **browser_options
-        )
-
-        context = await browser.new_context(
-            viewport={
-                "width": 1920,
-                "height": 1080
-            },
-            screen={
-                "width": 1920,
-                "height": 1080
-            },
-            locale="en-US",
-            timezone_id="America/Los_Angeles",
-        )
-
-        # ----------------------------------------------------
-        # Cookie
-        # ----------------------------------------------------
-
-        cookies = build_cookie()
-
-        if cookies:
-
-            await context.add_cookies(
-                cookies
-            )
-
-            log("🍪 HidenCloud Cookie 已加载")
-
-        page = await context.new_page()
-
-        # ----------------------------------------------------
-        # 自动接受 dialog
-        # ----------------------------------------------------
-
-        async def handle_dialog(dialog):
-
-            log(
-                f"⚠️ 检测到网页弹窗："
-                f"{dialog.message}"
-            )
-
-            try:
-                await dialog.accept()
-                log("✅ 已接受网页弹窗")
-            except Exception as e:
-                log(
-                    f"⚠️ 弹窗处理失败：{e}"
-                )
-
-        page.on(
-            "dialog",
-            handle_dialog
-        )
-
-        # ----------------------------------------------------
-        # 监听新页面
-        # ----------------------------------------------------
-
-        def page_created(new_page):
-
-            log(
-                f"🆕 检测到新页面："
-                f"{new_page.url}"
-            )
-
-        context.on(
-            "page",
-            page_created
-        )
-
-        # ====================================================
-        # 打开服务器管理页
-        # ====================================================
-
-        log(
-            f"🌐 打开：{SERVICE_URL}"
-        )
-
-        await page.goto(
-            SERVICE_URL,
-            wait_until="domcontentloaded",
-            timeout=60000
-        )
-
-        await asyncio.sleep(3)
-
-        await wait_cloudflare(
-            page,
-            timeout=30
-        )
-
-        log(
-            f"📍 当前 URL：{page.url}"
-        )
-
-        # ====================================================
-        # 登录检查
-        # ====================================================
-
-        body_text = ""
-
+def _click_cf_checkbox(page, frame_el=None):
+    """点击 Cloudflare/Turnstile 复选框：先试框架内元素（含嵌套 iframe），失败退化为坐标点击"""
+    for frame in page.frames:
+        if 'challenges.cloudflare.com' not in (frame.url or ''):
+            continue
         try:
-
-            body_text = await page.locator(
-                "body"
-            ).inner_text(timeout=10000)
-
+            frame.locator('input[type="checkbox"]').first.click(timeout=2500)
+            return True
+        except Exception:
+            continue
+    # 退化方案：复选框通常位于 iframe 左侧（x≈20~35，垂直居中），用真实鼠标事件点击
+    if frame_el is None:
+        return False
+    try:
+        try:
+            frame_el.scroll_into_view_if_needed(timeout=3000)
         except Exception:
             pass
+        box = frame_el.bounding_box()
+        if not box:
+            return False
+        x = box['x'] + random.uniform(18, 34)
+        y = box['y'] + box['height'] / 2 + random.uniform(-4, 4)
+        page.mouse.move(x - random.uniform(30, 60), y + random.uniform(-8, 8))
+        time.sleep(random.uniform(0.15, 0.4))
+        page.mouse.move(x, y)
+        time.sleep(random.uniform(0.05, 0.2))
+        page.mouse.down()
+        time.sleep(random.uniform(0.04, 0.1))
+        page.mouse.up()
+        return True
+    except Exception:
+        return False
 
-        if (
-            "login" in page.url.lower()
-            or "sign in" in body_text.lower()
-        ):
+SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention required', 'checking your browser', '请稍候', 'please wait', 'one more step')
 
-            log("❌ Cookie 登录失败")
-
-            await screenshot(
-                page,
-                "hidencloud_login_failed.png"
-            )
-
-            send_telegram(
-                "❌ HidenCloud 自动续期失败\n"
-                "原因：Cookie 登录失败"
-            )
-
-            await browser.close()
-
-            raise RuntimeError(
-                "HidenCloud Cookie 登录失败"
-            )
-
-        log("✅ Cookie 登录成功")
-
-        # ====================================================
-        # 获取旧 Due Date
-        # ====================================================
-
-        old_due_date = await get_due_date(
-            page
+def _is_security_check_page(page):
+    try:
+        title = (page.title() or '').lower()
+        if any(h in title for h in SECURITY_TITLE_HINTS):
+            return True
+    except Exception:
+        return True
+    try:
+        return page.evaluate(
+            """
+            () => {
+                const t = document.body ? document.body.innerText.slice(0, 5000).toLowerCase() : '';
+                return t.includes('verify you are human') || t.includes('checking your browser')
+                    || t.includes('security verification');
+            }
+            """
         )
+    except Exception:
+        return True
 
-        log(
-            f"📅 当前 Due Date："
-            f"{old_due_date}"
-        )
+def _has_interstitial_iframe(page):
+    """是否存在整页挑战 iframe（排除弹窗内 /turnstile/ 组件 iframe，那由 solve_modal_turnstile 处理）"""
+    try:
+        for handle in page.query_selector_all(CF_IFRAME_SELECTOR):
+            if '/turnstile/' not in (handle.get_attribute('src') or ''):
+                return True
+    except Exception:
+        pass
+    return False
 
-        # ====================================================
-        # 续期
-        # ====================================================
-
-        success = await renew_service(
-            page
-        )
-
-        if not success:
-
-            log("❌ 续期流程失败")
-
-            send_telegram(
-                "❌ HidenCloud 自动续期失败\n"
-                f"服务器：{SERVICE_ID}\n"
-                f"Due Date：{old_due_date}"
-            )
-
-            await browser.close()
-
-            raise RuntimeError(
-                "HidenCloud 续期失败"
-            )
-
-        # ====================================================
-        # 回服务器页面
-        # ====================================================
-
-        log("🔄 返回服务器管理页面...")
-
+def _click_security_submit(page):
+    """安全验证页 token 已生成但仍停在验证页时，尝试点击确认/继续按钮"""
+    for text in ('Verify', 'Continue', 'Submit', 'Proceed', '验证'):
         try:
+            btn = page.locator(f'button:has-text("{text}"):visible, input[type="submit"]:visible').first
+            if btn.count() > 0:
+                btn.click(timeout=3000)
+                log(f"🖱️ 已点击安全验证页的确认按钮（{text}）...")
+                return True
+        except Exception:
+            continue
+    return False
 
-            await page.goto(
-                SERVICE_URL,
-                wait_until="domcontentloaded",
-                timeout=60000
-            )
-
-        except Exception as e:
-
-            log(
-                f"⚠️ 返回管理页面异常：{e}"
-            )
-
-        await asyncio.sleep(5)
-
-        await wait_cloudflare(
-            page,
-            timeout=30
+def _dump_security_page(page):
+    """调试：采集安全验证页的关键结构（iframe/按钮/正文），便于排查"""
+    try:
+        page.screenshot(path="security_page.png")
+        srcs = page.evaluate(
+            "() => Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(Boolean)"
         )
 
-        # ====================================================
-        # 第一次检查
-        # ====================================================
-
-        new_due_date = await get_due_date(
-            page
+        buttons = page.evaluate(
+            "() => Array.from(document.querySelectorAll('button, input[type=submit], a.btn')).map(b => (b.innerText || b.value || '').trim()).filter(t => t && t.length < 40)"
         )
+        # log(f"🔍 验证页按钮: {buttons}")
+        body = page.evaluate("() => document.body ? document.body.innerText.slice(0, 200) : ''")
+        # log(f"🔍 验证页正文: {body}")
+    except Exception as e:
+        log(f"🔍 验证页信息采集失败: {e}")
 
-        log(
-            f"📅 当前 Due Date："
-            f"{new_due_date}"
-        )
+def handle_cloudflare(page, timeout=240):
+    def challenge_active():
+        return _has_interstitial_iframe(page) or _is_security_check_page(page)
 
-        # ====================================================
-        # 如果没有更新，等待
-        # ====================================================
-
-        if old_due_date == new_due_date:
-
-            log(
-                "⏳ Due Date 暂时没有变化"
-            )
-
-            log(
-                "⏳ 等待 HidenCloud 更新 Due Date..."
-            )
-
-            for i in range(6):
-
-                await asyncio.sleep(10)
-
-                try:
-
-                    await page.reload(
-                        wait_until="domcontentloaded",
-                        timeout=60000
-                    )
-
-                except Exception:
-                    pass
-
-                await wait_cloudflare(
-                    page,
-                    timeout=20
-                )
-
-                new_due_date = await get_due_date(
-                    page
-                )
-
-                log(
-                    f"🔄 第 {i + 1}/6 次检查："
-                    f"{new_due_date}"
-                )
-
-                if new_due_date != old_due_date:
-                    break
-
-        # ====================================================
-        # 最终结果
-        # ====================================================
-
-        log(
-            f"📆 续期后到期时间："
-            f"{new_due_date}"
-        )
-
-        if (
-            new_due_date
-            and old_due_date
-            and new_due_date != old_due_date
-        ):
-
-            log("🎉 HidenCloud 续期成功！")
-
-            message = (
-                "✅ HidenCloud 自动续期成功\n\n"
-                f"服务器：{SERVICE_ID}\n"
-                f"原到期时间：{old_due_date}\n"
-                f"新到期时间：{new_due_date}"
-            )
-
-            send_telegram(message)
-
+    if not challenge_active():
+        for _ in range(3):
+            time.sleep(1)
+            if challenge_active():
+                break
         else:
+            return True
 
-            log("❌ Due Date 没有变化")
+    log("🔒 检测到 Cloudflare 安全验证...")
+    time.sleep(5)
+    _dump_security_page(page)
 
-            log(
-                f"旧日期：{old_due_date}"
-            )
+    effective_timeout = timeout + (180 if timeout > 60 else 0)
+    manual_hinted = False
+    start_time = time.time()
+    last_click = 0
+    clear_rounds = 0
+    while time.time() - start_time < effective_timeout:
+        if not challenge_active():
+            clear_rounds += 1
+            if clear_rounds >= 2: 
+                # log("✅ Turnstile 安全验证通过！")
+                return True
+            time.sleep(1)
+            continue
+        clear_rounds = 0
+        if not manual_hinted and timeout > 60 and time.time() - start_time > timeout - 30:
+            log("🤝 自动点击未能通过验证，脚本会继续等待...")
+            manual_hinted = True
+        if time.time() - last_click > 6:
+            frames = _find_visible_cf_frames(page)
+            if frames:
+                log("🖱️ 点击 Turnstile 验证......")
+                if _click_cf_checkbox(page, frames[-1]):
+                    last_click = time.time()
+                    time.sleep(random.uniform(3, 5))
+                    continue
+            elif _get_turnstile_token(page) and _is_security_check_page(page):
+                # token 已生成但页面仍停在验证页：可能需要手动点确认按钮
+                if _click_security_submit(page):
+                    last_click = time.time()
+                    time.sleep(random.uniform(2, 4))
+                    continue
+        time.sleep(1)
+    log("❌ 验证超时。")
+    try:
+        page.screenshot(path="security_timeout.png")
+    except Exception:
+        pass
+    return False
 
-            log(
-                f"新日期：{new_due_date}"
-            )
+def solve_modal_turnstile(page, timeout=90):
+    log("🛡️ 开始处理 Turnstile 验证...")
+    start = time.time()
+    last_click = 0
+    clicks = 0
+    no_frame_seconds = 0
+    while time.time() - start < timeout:
+        # 1) token 已生成 → 验证通过
+        if _get_turnstile_token(page):
+            log("✅ Turnstile 验证通过！")
+            return True
+        frames = _find_visible_cf_frames(page)
+        if not frames:
+            # 弹窗里还没有 Turnstile（可能没加载出来），等 20 秒后视为无需验证
+            no_frame_seconds += 1
+            if no_frame_seconds >= 20 and clicks == 0:
+                log("ℹ️ 未检测到 Turnstile 验证框，无需验证。")
+                return True
+            time.sleep(1)
+            continue
+        no_frame_seconds = 0
+        # 2) 已点击过且框内复选框消失（变成对勾）→ 视为通过（token 字段名可能被站点自定义时兜底）
+        if clicks > 0 and time.time() - last_click > 4 and not _cf_checkbox_visible(page):
+            time.sleep(2)
+            if not _cf_checkbox_visible(page):
+                log("✅ Turnstile 复选框已消失，视为验证通过！")
+                return True
+        # 3) 存在可见验证框时，每隔几秒重试点击
+        if time.time() - last_click > 6 and _cf_checkbox_visible(page):
+            log(f"🖱️ 点击 Turnstile 复选框（第 {clicks + 1} 次）...")
+            if _click_cf_checkbox(page, frames[-1]):
+                clicks += 1
+                last_click = time.time()
+                time.sleep(random.uniform(3, 5))
+                continue
+        # 4) 长时间检测不到可点击的复选框时，直接坐标点击兜底
+        if clicks == 0 and time.time() - start > 20 and time.time() - last_click > 6:
+            if _click_cf_checkbox(page, frames[-1]):
+                clicks += 1
+                last_click = time.time()
+                time.sleep(random.uniform(3, 5))
+                continue
+        time.sleep(1)
+    if _get_turnstile_token(page):
+        log("✅ Turnstile 验证通过！")
+        return True
+    log("❌ Turnstile 验证超时。")
+    return False
 
-            await screenshot(
-                page,
-                "hidencloud_due_date_not_changed.png"
-            )
+def open_browser(p):
+    """启动浏览器，返回 (browser, page)。优先 patchright（反检测内核），未安装则退回原生 playwright。"""
+    proxy_arg = {"server": PROXY_SERVER} if IS_PROXY else None
+    if USING_PATCHRIGHT:
+        browser = p.chromium.launch(
+            channel="chrome",
+            headless=False,
+            args=['--disable-infobars'],
+            proxy=proxy_arg,
+        )
+        ctx = browser.new_context(viewport=None, proxy=proxy_arg)
+        page = ctx.new_page()
+        return browser, page
+    log("⚠️ 未安装 patchright（建议 pip install patchright），退回原生 playwright，过 Cloudflare 能力较弱")
+    browser = p.chromium.launch(
+        channel="chrome",
+        headless=False,
+        args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
+    )
+    ctx = browser.new_context(
+        viewport={'width': 1920, 'height': 1080},
+        user_agent=DEFAULT_UA,
+        proxy=proxy_arg,
+    )
+    page = ctx.new_page()
+    page.add_init_script(STEALTH_JS)
+    return browser, page
 
-            # 保存 HTML，方便下一次精准分析
+def _is_logged_in(page):
+    """是否真正处于登录后的控制台状态（防止把官网首页/验证页/登录页误判为登录成功）"""
+    try:
+        url = page.url or ''
+        if 'dash.hidencloud.com' not in url:
+            return False
+        if 'auth/login' in url or _is_security_check_page(page):
+            return False
+        return True
+    except Exception:
+        return False
+
+def login(page):
+    # 1. Cookie 登录尝试
+    if COOKIE_VALUE:
+        log("📇 尝试 Cookie 登录...")
+        try:
+            page.context.add_cookies([{
+                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
+                'value': COOKIE_VALUE,
+                'domain': 'dash.hidencloud.com',
+                'path': '/',
+                'expires': int(time.time()) + 3600 * 24 * 365,
+                'httpOnly': True,
+                'secure': True,
+                'sameSite': 'Lax'
+            }])
+            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page, timeout=240)
+            time.sleep(2)
+            handle_cloudflare(page, timeout=60)  # 跳转后可能再次出现验证页
+            if _is_logged_in(page):
+                log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
+                return True
+            log("❌ Cookie 失效，请更换")
+        except Exception as e:
+            log(f"⚠️ Cookie 登录尝试异常: {e}")
+
+    # 2. 账号密码登录
+    if not EMAIL or not PASSWORD:
+        return False
+    log("💣 尝试账号密码登录...")
+    try:
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page, timeout=240)
+        time.sleep(2)
+        
+        log("⌨️ 输入账号密码...")
+        # 真实表单字段：input[name="username"]（可填邮箱或用户名）/ input[name="password"]
+        user_input = page.locator('input[name="username"], input[name="email"], input[type="email"]').first
+        pwd_input = page.locator('input[name="password"], input[type="password"]').first
+        try:
+            # 登录表单要等安全验证页通过后才会渲染
+            user_input.wait_for(state="visible", timeout=30000)
+        except Exception:
+            handle_cloudflare(page, timeout=120)
+            user_input.wait_for(state="visible", timeout=30000)
+        user_input.fill(EMAIL, timeout=10000)
+        pwd_input.fill(PASSWORD, timeout=10000)
+        time.sleep(0.5)
+        handle_cloudflare(page, timeout=60)
+
+        # 登录表单自带 Turnstile，提交前先等它的 token
+        if not solve_modal_turnstile(page, timeout=90):
+            log("⚠️ 登录表单的 Turnstile 未确认通过，仍将尝试提交...")
+        
+        log("🖱️ 点击登录按钮提交...")
+        try:
+            page.click('button[type="submit"]', timeout=8000)
+        except Exception:
+            page.locator('button:has-text("Sign in"), button:has-text("登录")').first.click(timeout=10000)
+        time.sleep(3)
+        handle_cloudflare(page, timeout=240)
+        nav_start = time.time()
+        navigated = False
+        while time.time() - nav_start < 120:
             try:
-
-                with open(
-                    "/tmp/hidencloud_debug.html",
-                    "w",
-                    encoding="utf-8"
-                ) as f:
-
-                    f.write(
-                        await page.content()
-                    )
-
-                log(
-                    "📄 HTML 已保存："
-                    "/tmp/hidencloud_debug.html"
-                )
-
+                if "/auth/login" not in page.url and not _is_security_check_page(page):
+                    navigated = True
+                    break
+                if _is_security_check_page(page) or _has_interstitial_iframe(page):
+                    handle_cloudflare(page, timeout=60)
             except Exception:
                 pass
+            time.sleep(1)
+        if not navigated:
+            log("❌ 登录提交后未能完成跳转。")
+            page.screenshot(path="login_fail.png")
+            return False
+        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page, timeout=120)
+        page_title = page.title()
+        log(f"📝 当前Title: {page_title}")
+        if not _is_logged_in(page):
+            log("❌ 登录失败。")
+            return False
+        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
+        return True
+    except Exception as e:
+        log(f"❌ 登录异常: {e}")
+        page.screenshot(path="login_fail.png")
+        return False
 
-            send_telegram(
-                "❌ HidenCloud 自动续期失败\n\n"
-                f"服务器：{SERVICE_ID}\n"
-                f"旧日期：{old_due_date}\n"
-                f"新日期：{new_due_date}\n\n"
-                "Pay Now 点击/付款状态可能未完成。"
-            )
+def get_server_id(page):
+    try:
+        if 'dash.hidencloud.com' not in page.url:
+            log("⚠️ 当前不在控制台页面，先跳转 dashboard...")
+            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page)
+            time.sleep(2)
+        handle_cloudflare(page)
+        time.sleep(3)
+        html = page.content()
+        log(f"📝 页面长度: {len(html)}, URL: {page.url}")
 
-            await browser.close()
+        # 方案1: 从 href 链接中提取 /service/数字/manage
+        matches = re.findall(r'/service/(\d+)/manage', html)
+        if matches:
+            server_id = matches[0]
+            log(f"✅ 从链接中获取到 Server ID: {server_id}")
+            return server_id
 
-            raise RuntimeError(
-                "Due Date 没有变化"
-            )
+        # 方案2: 从 span 标签中提取 #数字 (如 "Free Server #218079")；过滤全 0 的误匹配
+        matches = [m for m in re.findall(r'#(\d{4,})', html) if set(m) != {'0'}]
+        if matches:
+            server_id = matches[0]
+            log(f"✅ 从文本 #号中获取到 Server ID: {server_id}")
+            return server_id
 
-        await browser.close()
+        log("❌ 所有 URL 均未找到 Server ID")
+        return None
+    except Exception as e:
+        log(f"❌ 获取 Server ID 失败: {e}")
+        page.screenshot(path="server_id_error.png")
+        return None
 
+def get_due_date(page):
+    try:
+        if SERVICE_URL not in page.url:
+            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
+        body_text = page.locator("body").inner_text()
+        patterns = [
+            r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            r"Due date\s*\n\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            r"Due date.*?(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
+            if match:
+                due_date = match.group(1).strip()
+                log(f"📅 获取到Due Date: {due_date}")
+                return due_date
+    except Exception as e:
+        log(f"❌ 获取Due Date失败: {e}")
+    return "未知"
 
-# ============================================================
-# Entry
-# ============================================================
-
-if __name__ == "__main__":
+def renew_service(page):
 
     try:
+        log("➡ 进入续期流程...")
+        if page.url != SERVICE_URL:
+            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
 
-        asyncio.run(
-            main()
-        )
+        log("🖱️ 准备点击 Renew 按钮...")
+        renew_btn = page.locator('button:has-text("Renew")')
+        create_btn = page.locator('button:has-text("Create Invoice")')
 
-    except KeyboardInterrupt:
+        modal_opened = False
+        for i in range(6):
+            try:
+                renew_btn.wait_for(state="visible", timeout=10000)
+                renew_btn.scroll_into_view_if_needed()
+                log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
+                renew_btn.click()
 
-        log("程序被手动停止")
+                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
+                time.sleep(3)
+                page_text = page.locator("body").inner_text()
+                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
+                    log("⚠️ 未到续期时间，无法续期。")
+                    page.screenshot(path="renew_not_allowed.png")
+                    return "NOT_TIME"   # 特殊状态
+
+                log("🖲️ 等待弹窗出现...")
+                try:
+                    create_btn.wait_for(state="visible", timeout=8000)
+                    modal_opened = True
+                    log("✅ 弹窗已成功弹出！")
+                    break
+                except:
+                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+                    time.sleep(2)
+            except Exception as e:
+                log(f"❌ 点击尝试出错: {e}")
+
+        if not modal_opened:
+            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
+            page.screenshot(path="renew_modal_failed.png")
+            return False
+
+        # 弹窗内先完成 Turnstile 人机验证，再提交
+        handle_cloudflare(page, timeout=60)
+        if not solve_modal_turnstile(page, timeout=90):
+            log("⚠️ Turnstile 未确认通过，仍将尝试提交...")
+            page.screenshot(path="turnstile_timeout.png")
+
+        # 点击 Create Invoice；未跳转说明验证未通过/已过期，重做验证后再试
+        new_invoice_url = None
+        for attempt in range(6):
+            log(f"🖱️ 点击 'Create Invoice'（第 {attempt + 1} 次）...")
+            try:
+                create_btn.wait_for(state="visible", timeout=20000)
+                create_btn.click(timeout=20000)
+            except Exception as e:
+                log(f"⚠️ 点击 Create Invoice 失败: {e}")
+                solve_modal_turnstile(page, timeout=45)
+                continue
+
+            start_wait = time.time()
+            while time.time() - start_wait < 30:
+                if "/payment/invoice/" in page.url:
+                    new_invoice_url = page.url
+                    log(f"🎉 页面已跳转: {new_invoice_url}")
+                    break
+                # 出现整页 Cloudflare 拦截/安全验证页时先处理（弹窗内的 Turnstile 组件交给 solve_modal_turnstile）
+                if _has_interstitial_iframe(page) or _is_security_check_page(page):
+                    log("⚠️ 遇到整页拦截，尝试处理...")
+                    handle_cloudflare(page, timeout=60)
+                time.sleep(1)
+            if new_invoice_url:
+                break
+
+            log("⚠️ 未跳转到发票页面，尝试重新完成 Turnstile 验证后重试...")
+            solve_modal_turnstile(page, timeout=45)
+
+        if not new_invoice_url:
+            log("❌ 未能进入发票页面，超时。")
+            page.screenshot(path="renew_stuck_invoice.png")
+            return False
+
+        if page.url != new_invoice_url:
+            page.goto(new_invoice_url)
+        handle_cloudflare(page)
+
+        log("🔎 查找 Pay 按钮...")
+        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+        pay_btn.wait_for(state="visible", timeout=30000)
+        pay_btn.click()
+        log("✅ Pay 按钮已点击")
+
+        # 等待支付确认页面或跳转回服务页
+        time.sleep(5)
+        # 返回服务管理页面以获取新的到期时间
+        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page)
+        return True
 
     except Exception as e:
+        log(f"❌ 续费异常: {e}")
+        page.screenshot(path="renew_error.png")
+        return False
 
-        log(
-            f"❌ 程序异常：{e}"
-        )
+def main():
+    # 检查必要环境变量
+    log(f"🔍 凭证检测: COOKIE_VALUE={'已配置' if COOKIE_VALUE else '未配置'}, "
+        f"EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
+    if not COOKIE_VALUE and not (EMAIL and PASSWORD):
+        log("❌ 缺少登录凭证")
+        sys.exit(1)
 
-        traceback.print_exc()
+    global SERVICE_URL
 
-        raise
+    with sync_playwright() as p:
+        browser = None
+        try:
+            if IS_PROXY:
+                log(f"⚙️ 代理已启用: {PROXY_SERVER}")
+            else:
+                log("🌐 直连模式（未使用代理）")
+            
+            # 获取当前出口ip
+            current_ip = get_current_ip(PROXY_SERVER)
+            log(f"🎯 当前出口IP: {current_ip}")
+
+            log("🚀 启动反检测内核浏览器...") # 使用patchright 反检测内核
+            browser, page = open_browser(p)
+
+            if not login(page):
+                sys.exit(1)
+
+            # 登录成功后，自动获取 Server ID
+            server_id = get_server_id(page)
+            if not server_id:
+                log("❌ 无法获取 Server ID，退出。")
+                sys.exit(1)
+            SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
+
+            # 获取旧到期时间
+            old_due = get_due_date(page)
+            log(f"📆 续费前到期时间：{old_due}")
+
+            # 执行续费
+            renew_result = renew_service(page)
+
+            new_due = old_due
+            if renew_result == "NOT_TIME":
+                log("⏳ 未到续期时间，目前无法续期")
+                status = "⏳ 未到续期时间"
+            elif renew_result is False:
+                log("❌ 续费失败，脚本退出。")
+                status = "❌ 续期失败"
+            else:  # renew_result is True
+                new_due = get_due_date(page)
+                log(f"📆 续费后到期时间：{new_due}")
+                status = "✅ 续期成功"
+
+            # 发送 Telegram 通知
+            send_telegram_notification(status, old_due, new_due, current_ip)
+
+            if renew_result == "NOT_TIME":
+                sys.exit(0)
+            elif renew_result is False:
+                sys.exit(1)
+            else:
+                sys.exit(0)
+        except Exception as e:
+            log(f"❌ 浏览器启动出错: {e}")
+            sys.exit(1)
+        finally:
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                
+if __name__ == "__main__":
+    main()
